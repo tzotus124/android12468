@@ -21,6 +21,18 @@ class BootReceiver : BroadcastReceiver() {
 fun hmac(key: String, msg: String): String = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key.toByteArray(), "HmacSHA256")) }
     .doFinal(msg.toByteArray()).joinToString("") { "%02x".format(it) }
 
+private val LOG_LOCK = Any()
+fun addLog(c: Context, text: String) = synchronized(LOG_LOCK) {
+    val stamp = java.text.SimpleDateFormat("dd MMM HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
+    val old = org.json.JSONArray(prefs(c).getString("log", "[]"))
+    val n = org.json.JSONArray().put("$stamp  $text")
+    for (i in 0 until minOf(old.length(), 199)) n.put(old.getString(i))
+    prefs(c).edit().putString("log", n.toString()).apply()
+}
+fun loadLog(c: Context): List<String> = runCatching {
+    val a = org.json.JSONArray(prefs(c).getString("log", "[]")); (0 until a.length()).map { a.getString(it) }
+}.getOrDefault(emptyList())
+
 class RelayService : Service() {
     @Volatile private var running = false
     private var server: ServerSocket? = null
@@ -60,10 +72,11 @@ class RelayService : Service() {
             val act = j.optString("action"); val t = j.optString("ts"); val msg = "$t|$mac|$ip|$act"
             val secrets = prefs(this).getStringSet("secrets", emptySet()) ?: emptySet()
             val fresh = Math.abs(System.currentTimeMillis() / 1000 - (t.toLongOrNull() ?: 0L)) <= 60
-            if (!fresh || secrets.none { hmac(it, msg) == j.optString("sig") }) return reply("DENIED (invalid token)")
+            if (!fresh || secrets.none { hmac(it, msg) == j.optString("sig") }) { addLog(this@RelayService, "✖ Rejected request from $src (invalid token)"); return reply("DENIED (invalid token)") }
             if (act == "ping") return reply("PONG|${Build.MODEL}")
-            val m = mac.ifEmpty { arpLookup(ip) } ?: return reply("NEED_MAC (IP not in ARP cache, use MAC)")
-            sendMagic(m, ip.ifEmpty { null }); reply("OK")
+            val m = mac.ifEmpty { arpLookup(ip) } ?: run { addLog(this@RelayService, "✖ Wake ${ip.ifEmpty { "?" }} from $src failed: MAC unknown"); return reply("NEED_MAC (IP not in ARP cache, use MAC)") }
+            sendMagic(m, ip.ifEmpty { null })
+            addLog(this@RelayService, "✔ Wake $m${if (ip.isNotEmpty()) " ($ip)" else ""} from $src"); reply("OK")
         } catch (e: Exception) { runCatching { reply("ERROR ${e.message}") } }
     }
 

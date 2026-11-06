@@ -82,9 +82,10 @@ class MainActivity : ComponentActivity() {
         var apiKey by remember { mutableStateOf(prefs(this).getString("api", "") ?: "") }
         var pcToken by remember { mutableStateOf("") }
         var msg by remember { mutableStateOf("") }
+        var log by remember { mutableStateOf(loadLog(this)) }
         var tried by rememberSaveable { mutableStateOf(0) }   // each step auto-opens once
 
-        LaunchedEffect(Unit) { while (true) { installed = tsInstalled(); ip = tailscaleIp(); batt = batteryOk(); delay(1500) } }
+        LaunchedEffect(Unit) { while (true) { installed = tsInstalled(); ip = tailscaleIp(); batt = batteryOk(); log = loadLog(this@MainActivity); delay(1500) } }
         LaunchedEffect(installed, ip, batt) {
             when {
                 !installed && tried and 1 == 0 -> { tried = tried or 1; installTs() }
@@ -154,6 +155,14 @@ class MainActivity : ComponentActivity() {
                 Text("Tailscale", color = Color.White, fontWeight = FontWeight.SemiBold)
                 Text(if (ip != null) "● Connected  $ip" else "● Not connected", color = if (ip != null) Color(0xFF22C55E) else Color(0xFFF59E0B))
                 Text("Link your PC with a token: generate one in the PC token card above and paste it into the PC app.", color = Color(0xFF9DB2FF), modifier = Modifier.padding(top = 8.dp))
+            }
+            Card {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Wake log", color = Color.White, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    TextButton({ prefs(this@MainActivity).edit().remove("log").apply(); log = emptyList() }) { Text("Clear") }
+                }
+                if (log.isEmpty()) Text("No wake requests yet.", color = Color.Gray)
+                log.take(40).forEach { Text(it, color = Color.White, fontSize = 12.sp, modifier = Modifier.padding(vertical = 2.dp)) }
             }
         }
     }
