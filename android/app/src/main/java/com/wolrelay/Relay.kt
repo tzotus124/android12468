@@ -1,184 +1,135 @@
 package com.wolrelay
 
 import android.content.Context
-import com.wireguard.android.backend.GoBackend
-import com.wireguard.android.backend.Tunnel
-import com.wireguard.config.Config
-import com.wireguard.config.InetEndpoint
-import com.wireguard.config.InetNetwork
-import com.wireguard.config.Interface
-import com.wireguard.config.Peer
-import com.wireguard.crypto.Key
-import com.wireguard.crypto.KeyPair
+import android.util.Base64
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import org.json.JSONObject
-import java.net.*
+import java.net.ServerSocket
+import java.net.SocketTimeoutException
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlin.math.abs
 
 data class UiState(
-    val paired: Boolean = false, val token: String? = null, val tokenExpires: Long = 0,
-    val status: String = "Idle", val tunnelUp: Boolean = false, val fingerprint: String = "",
+    val paired: Boolean = false, val token: String? = null, val tokenExpires: Long = 0, val pendingFp: String? = null,
+    val status: String = "Idle", val tailnetIp: String? = null, val fingerprint: String = "",
     val lastWake: String = "No wakes yet", val running: Boolean = false, val log: List<String> = emptyList(),
 )
 
+/**
+ * Networking is done by Tailscale (the official Tailscale app on this phone, which requires sign-in).
+ * This object only (1) pairs with the PC and hands it a Tailscale pre-auth key so the PC never needs a login,
+ * and (2) listens on port 9009 for signed wake commands arriving over the tailnet.
+ */
 object Relay {
-    private const val UDP_PORT = 51899
-    private const val WG_PORT = 51820
     private const val CMD_PORT = 9009
-    private const val ANDROID_IP = "10.77.0.1"
-    private const val PC_IP = "10.77.0.2"
 
     val state = MutableStateFlow(UiState())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var loopJob: Job? = null
     private var pairJob: Job? = null
+    private var confirmation: CompletableDeferred<Boolean>? = null
     private lateinit var app: Context
-    private val backend by lazy { GoBackend(app) }
-    private val tunnel = object : Tunnel {
-        override fun getName() = "wolrelay"
-        override fun onStateChange(newState: Tunnel.State) { state.update { it.copy(tunnelUp = newState == Tunnel.State.UP) } }
-    }
+    private fun fp() = if (Prefs.paired) Crypto.fingerprint(Prefs.room, Prefs.phoneIp, Prefs.pcIp) else ""
 
     fun init(ctx: Context) {
         app = ctx.applicationContext; Prefs.init(app)
-        state.update { it.copy(paired = Prefs.paired, fingerprint = fp()) }
+        state.update { it.copy(paired = Prefs.paired, fingerprint = fp(), tailnetIp = Tailnet.localIp()) }
     }
 
-    private fun fp(): String {
-        if (!Prefs.paired) return ""
-        val h = MessageDigest.getInstance("SHA-256").digest(listOf(Prefs.pub, Prefs.pcPub).sorted().joinToString("").toByteArray())
-            .joinToString("") { "%02X".format(it) }
-        return "${h.substring(0, 4)}-${h.substring(4, 8)}-${h.substring(8, 12)}"
-    }
+    fun refreshTailnet() { val ip = Tailnet.localIp(); if (ip != state.value.tailnetIp) state.update { it.copy(tailnetIp = ip) } }
 
     private fun log(msg: String, status: String? = null) = state.update {
         it.copy(status = status ?: it.status, log = (listOf(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()) + "  " + msg) + it.log).take(40))
     }
 
-    private fun http(method: String, url: String, body: JSONObject? = null, readMs: Int = 10000): JSONObject {
-        val c = URL(url).openConnection() as HttpURLConnection
-        c.requestMethod = method; c.connectTimeout = 8000; c.readTimeout = readMs
-        if (body != null) { c.doOutput = true; c.setRequestProperty("Content-Type", "application/json"); c.outputStream.use { it.write(body.toString().toByteArray()) } }
-        val code = c.responseCode
-        val text = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
-        if (code >= 400) error(runCatching { JSONObject(text).getString("error") }.getOrDefault("HTTP $code"))
-        return JSONObject(text)
-    }
+    // ---------- pairing: 6-digit token ----------
+    fun confirm(ok: Boolean) { confirmation?.complete(ok) }
 
-    // ---------- pairing ----------
-    fun startPairing(server: String) {
+    /** [authKey] is a Tailscale pre-auth key. It is sent (encrypted) to the PC once and never stored on the phone. */
+    fun startPairing(authKey: String) {
         pairJob?.cancel()
         pairJob = scope.launch {
+            val job = currentCoroutineContext()[Job]!!
             try {
-                val url = server.trim().trimEnd('/'); Prefs.server = url
-                val kp = KeyPair()
-                val r = http("POST", "$url/pair/create", JSONObject().put("pub", kp.publicKey.toBase64()))
-                val room = r.getString("room"); val exp = System.currentTimeMillis() + r.getInt("expires") * 1000L
-                state.update { it.copy(token = r.getString("token"), tokenExpires = exp, status = "Waiting for the PC…") }
-                var since = 0
-                while (System.currentTimeMillis() < exp) {
-                    val w = http("GET", "$url/room/$room?role=android&since=$since", null, 35000)
-                    since = w.getInt("ver")
-                    if (!w.isNull("peer_pub")) {
-                        Prefs.room = room; Prefs.priv = kp.privateKey.toBase64(); Prefs.pub = kp.publicKey.toBase64(); Prefs.pcPub = w.getString("peer_pub")
-                        state.update { it.copy(paired = true, token = null, fingerprint = fp(), status = "Linked") }
-                        log("Linked with a PC"); return@launch
-                    }
+                val phoneIp = Tailnet.localIp() ?: run { log("Sign in to Tailscale first", "Tailscale needed"); return@launch }
+                val token = "%06d".format(SecureRandom().nextInt(1_000_000))
+                val roomBytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
+                val room = Base64.encodeToString(roomBytes, Base64.NO_WRAP)
+                val key = Crypto.pairKey(token); val topic = Crypto.pairTopic(token)
+                val t0 = System.currentTimeMillis(); val exp = t0 + 120_000
+                state.update { it.copy(token = token, tokenExpires = exp, pendingFp = null, status = "Waiting for the PC…") }
+                Ntfy.publish(topic, Crypto.seal(key, JSONObject().put("t", "offer").put("room", room)
+                    .put("ip", phoneIp).put("authkey", authKey.trim()).toString()))
+                var pcIp: String? = null
+                Ntfy.listen(topic, t0 / 1000 - 2, 10_000, exp, { job.isActive }) { m ->
+                    val p = Crypto.open(key, m.text)
+                    if (p != null && p.optString("t") == "answer") { pcIp = p.getString("ip"); true } else false
                 }
-                state.update { it.copy(token = null, status = "Token expired") }
+                val pc = pcIp
+                if (pc == null) { state.update { it.copy(token = null, status = "Token expired") }; return@launch }
+                if (!runCatching { Tailnet.isTailnet(java.net.InetAddress.getByName(pc)) }.getOrDefault(false)) {
+                    state.update { it.copy(token = null) }; log("PC sent an invalid address", "Error"); return@launch
+                }
+                val d = CompletableDeferred<Boolean>(); confirmation = d
+                state.update { it.copy(token = null, pendingFp = Crypto.fingerprint(room, phoneIp, pc), status = "Confirm the PC") }
+                if (withTimeoutOrNull(120_000) { d.await() } != true) { state.update { it.copy(pendingFp = null, status = "Link cancelled") }; return@launch }
+                Prefs.room = room; Prefs.phoneIp = phoneIp; Prefs.pcIp = pc
+                state.update { it.copy(paired = true, pendingFp = null, fingerprint = fp(), status = "Linked") }
+                log("Linked with a PC")
+                start()
             } catch (e: CancellationException) { throw e
-            } catch (e: Exception) { state.update { it.copy(token = null) }; log("Pairing failed: ${e.message}", "Error") }
+            } catch (e: Exception) { state.update { it.copy(token = null, pendingFp = null) }; log("Pairing failed: ${e.message}", "Error") }
         }
     }
 
     fun unpair() {
-        pairJob?.cancel()
-        val (s, r) = Prefs.server to Prefs.room
-        scope.launch { runCatching { http("DELETE", "$s/room/$r") } }
-        Prefs.clearPairing(); state.update { it.copy(paired = false, token = null, fingerprint = "", status = "Idle") }
+        pairJob?.cancel(); Prefs.clearPairing()
+        state.update { it.copy(paired = false, token = null, pendingFp = null, fingerprint = "", status = "Idle") }
     }
 
-    // ---------- always-on loop (runs inside the foreground service) ----------
+    // ---------- always-on listener (runs inside the foreground service) ----------
     fun start() {
         if (loopJob?.isActive == true) return
         state.update { it.copy(running = true, status = "Listening") }
         loopJob = scope.launch {
-            var since = 0; var handled = 0.0
             while (isActive) {
                 if (!Prefs.paired) { delay(2000); continue }
                 try {
-                    val r = http("GET", "${Prefs.server}/room/${Prefs.room}?role=android&since=$since", null, 35000)
-                    since = r.getInt("ver")
-                    val st = r.getJSONObject("stamps"); val pc = st.optDouble("pc", 0.0); val an = st.optDouble("android", 0.0)
-                    if (pc > handled && pc > an && !r.isNull("peer_ep")) { handled = pc; session(r.getString("peer_ep")) }
+                    ServerSocket(CMD_PORT).use { ss ->
+                        ss.soTimeout = 3000
+                        while (isActive && Prefs.paired) {
+                            val c = try { ss.accept() } catch (_: SocketTimeoutException) { continue }
+                            c.use {
+                                // Only the paired PC's tailnet address, and only correctly signed commands.
+                                if (it.inetAddress.hostAddress != Prefs.pcIp) return@use
+                                it.soTimeout = 5000
+                                val reply = try { handle(it.getInputStream().bufferedReader().readLine()) }
+                                catch (e: Exception) { JSONObject().put("ok", false).put("err", e.message ?: "error") }
+                                it.getOutputStream().write((reply.toString() + "\n").toByteArray())
+                            }
+                        }
+                    }
                 } catch (e: CancellationException) { throw e
-                } catch (e: Exception) { log("Server: ${e.message}", "Reconnecting…"); delay(5000) }
+                } catch (e: Exception) { log("Listener: ${e.message}", "Reconnecting…"); delay(5000) }
             }
         }
     }
 
-    fun stop() { loopJob?.cancel(); runCatching { backend.setState(tunnel, Tunnel.State.DOWN, null) }; state.update { it.copy(running = false, status = "Stopped", tunnelUp = false) } }
-
-    private fun discover() {
-        DatagramSocket(null).use { s ->
-            s.reuseAddress = true; s.bind(InetSocketAddress(WG_PORT)); s.soTimeout = 2500
-            val d = "android:${Prefs.room}".toByteArray(); val host = InetAddress.getByName(URL(Prefs.server).host)
-            repeat(3) {
-                s.send(DatagramPacket(d, d.size, host, UDP_PORT))
-                try { s.receive(DatagramPacket(ByteArray(64), 64)); return } catch (_: SocketTimeoutException) {}
-            }
-            error("Rendezvous UDP port unreachable")
-        }
-    }
-
-    private fun tunnelUp(pcEndpoint: String) {
-        val cfg = Config.Builder()
-            .setInterface(Interface.Builder().addAddress(InetNetwork.parse("$ANDROID_IP/24")).parsePrivateKey(Prefs.priv).setListenPort(WG_PORT).build())
-            .addPeer(Peer.Builder().parsePublicKey(Prefs.pcPub).addAllowedIp(InetNetwork.parse("$PC_IP/32"))
-                .setEndpoint(InetEndpoint.parse(pcEndpoint)).setPersistentKeepalive(15).build())
-            .build()
-        backend.setState(tunnel, Tunnel.State.UP, cfg)
-    }
-
-    private suspend fun session(pcEndpoint: String) {
-        log("PC is calling", "Opening tunnel…")
-        try {
-            discover(); tunnelUp(pcEndpoint)
-            log("Tunnel up", "Connected")
-            serve()
-        } catch (e: CancellationException) { throw e
-        } catch (e: Exception) { log("Session failed: ${e.message}", "Error") }
-        finally { runCatching { backend.setState(tunnel, Tunnel.State.DOWN, null) }; state.update { it.copy(tunnelUp = false, status = "Listening") } }
-    }
-
-    /** Accepts commands only from the paired PC's tunnel address; ends after 90 s idle or 10 min total. */
-    private suspend fun serve() = withContext(Dispatchers.IO) {
-        val started = System.currentTimeMillis(); var last = started
-        ServerSocket(CMD_PORT).use { ss ->
-            ss.soTimeout = 3000
-            while (isActive && System.currentTimeMillis() - last < 90_000 && System.currentTimeMillis() - started < 600_000) {
-                val c = try { ss.accept() } catch (_: SocketTimeoutException) { continue }
-                c.use {
-                    if (it.inetAddress.hostAddress != PC_IP) return@use
-                    last = System.currentTimeMillis()
-                    it.soTimeout = 5000
-                    val reply = try { handle(it.getInputStream().bufferedReader().readLine()) }
-                    catch (e: Exception) { JSONObject().put("ok", false).put("err", e.message ?: "error") }
-                    it.getOutputStream().write((reply.toString() + "\n").toByteArray())
-                }
-            }
-        }
-    }
+    fun stop() { loopJob?.cancel(); loopJob = null; state.update { it.copy(running = false, status = "Stopped") } }
 
     private fun handle(line: String): JSONObject {
         fun fail(e: String) = JSONObject().put("ok", false).put("err", e)
         val j = JSONObject(line)
-        if (j.optString("cmd") != "wake") return fail("bad_cmd")
-        var mac = j.optString("mac"); val ip = j.optString("ip")
+        val ts = j.optLong("ts"); val cmd = j.optString("cmd"); var mac = j.optString("mac"); val ip = j.optString("ip")
+        val expect = Crypto.hmacHex(Crypto.sigKey(Base64.decode(Prefs.room, Base64.NO_WRAP)), "$cmd|$mac|$ip|$ts")
+        if (abs(System.currentTimeMillis() / 1000 - ts) > 120 ||
+            !MessageDigest.isEqual(expect.toByteArray(), j.optString("sig").toByteArray())) return fail("unauthorized")
+        if (cmd != "wake") return fail("bad_cmd")
         if (mac.isEmpty() && ip.isNotEmpty()) mac = WakeOnLan.arpLookup(ip) ?: return fail("unknown_mac")
         if (!Regex("^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$").matches(mac)) return fail("bad_mac")
         WakeOnLan.send(app, mac)

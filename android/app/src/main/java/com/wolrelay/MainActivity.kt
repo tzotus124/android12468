@@ -3,7 +3,6 @@ package com.wolrelay
 import android.Manifest
 import android.content.Intent
 import android.net.Uri
-import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
@@ -27,12 +26,15 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 
 private val Bg = Color(0xFF0D1117); private val Card = Color(0xFF161B22); private val Ink = Color(0xFFE6EDF3)
 private val Muted = Color(0xFF8B949E); private val Accent = Color(0xFF3DDC97); private val Bad = Color(0xFFFF6B6B)
+
+private const val TS_PKG = "com.tailscale.ipn"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(b: Bundle?) {
@@ -48,12 +50,47 @@ private fun Screen() {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val st by Relay.state.collectAsState()
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) { while (true) { now = System.currentTimeMillis(); delay(1000) } }
+    LaunchedEffect(Unit) { while (true) { now = System.currentTimeMillis(); Relay.refreshTailnet(); delay(1000) } }
+    var authKey by remember { mutableStateOf("") }
 
-    val notif = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
-    val begin = { Relay.startPairing(BuildConfig.RELAY_SERVER); RelayService.start(ctx) }
-    val vpn = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { if (it.resultCode == -1) begin() }
-    LaunchedEffect(Unit) { if (Build.VERSION.SDK_INT >= 33) notif.launch(Manifest.permission.POST_NOTIFICATIONS); if (Prefs.paired) RelayService.start(ctx) }
+    val begin = { Relay.startPairing(authKey); RelayService.start(ctx); authKey = "" }
+    val tsInstalled = { runCatching { ctx.packageManager.getPackageInfo(TS_PKG, 0); true }.getOrDefault(false) }
+    val openTailscale = {
+        val i = ctx.packageManager.getLaunchIntentForPackage(TS_PKG)
+            ?: Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$TS_PKG"))
+        runCatching { ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }.onFailure {
+            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=$TS_PKG")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }
+    }
+
+    // Startup setup, one step per launch of the app (and again each time the user returns to it):
+    // 1 notifications  2 this app's battery exemption  3 install Tailscale if missing  4 Tailscale's battery exemption.
+    val asked = remember { BooleanArray(4) }
+    val proceedRef = remember { arrayOf<() -> Unit>({}) }
+    val battery = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { proceedRef[0]() }
+    val notif = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { proceedRef[0]() }
+    proceedRef[0] = {
+        val pm = ctx.getSystemService(PowerManager::class.java)
+        when {
+            Build.VERSION.SDK_INT >= 33 && !asked[0] && ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED ->
+                { asked[0] = true; notif.launch(Manifest.permission.POST_NOTIFICATIONS) }
+            !asked[1] && !pm.isIgnoringBatteryOptimizations(ctx.packageName) ->
+                { asked[1] = true; battery.launch(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${ctx.packageName}"))) }
+            !asked[2] && !tsInstalled() -> { asked[2] = true; openTailscale() }
+            !asked[3] && tsInstalled() && !Prefs.tsBatteryAsked -> {
+                // Android only lets an app request its OWN exemption, so for Tailscale we open the system list where the user flips it.
+                asked[3] = true; Prefs.tsBatteryAsked = true
+                android.widget.Toast.makeText(ctx, "Set Tailscale to “Don't optimize” / Unrestricted", android.widget.Toast.LENGTH_LONG).show()
+                ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }
+        }
+    }
+    val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(lifecycle) {
+        val o = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) proceedRef[0]() }
+        lifecycle.addObserver(o); onDispose { lifecycle.removeObserver(o) }
+    }
+    LaunchedEffect(Unit) { if (Prefs.paired) RelayService.start(ctx) }
 
     Column(Modifier.fillMaxSize().background(Bg).verticalScroll(rememberScrollState()).statusBarsPadding().padding(24.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -68,21 +105,37 @@ private fun Screen() {
         Spacer(Modifier.height(16.dp))
 
         if (!st.paired) {
-            Panel("Link a PC", "Tap Generate token, then type the 6 digits into the PC app.") {
+            Panel("1. Sign in to Tailscale", "Required on this phone. Wake Relay offers to install Tailscale if it is missing; sign in there, then come back.") {
+                if (st.tailnetIp != null) Text("Signed in · ${st.tailnetIp}", color = Accent, fontSize = 14.sp, fontFamily = FontFamily.Monospace)
+                else if (!tsInstalled()) Primary("Install Tailscale") { openTailscale() }
+                else Primary("Open Tailscale to sign in") { openTailscale() }
+            }
+            Panel("2. Link a PC", "Paste a Tailscale auth key (admin console > Settings > Keys; one-off, pre-approved, short expiry). It lets the PC join without any login. Then tap Generate token and type the 6 digits into the PC app.") {
+                val ready = st.tailnetIp != null
+                if (st.token == null && st.pendingFp == null) OutlinedTextField(authKey, { authKey = it }, Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                    label = { Text("tskey-auth-…") }, singleLine = true, enabled = ready, visualTransformation = PasswordVisualTransformation())
                 val left = ((st.tokenExpires - now) / 1000).coerceAtLeast(0)
-                if (st.token != null && left > 0) {
+                if (st.pendingFp != null) {
+                    Text("PC fingerprint", color = Muted, fontSize = 12.sp)
+                    Text(st.pendingFp!!, color = Accent, fontSize = 26.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(vertical = 8.dp))
+                    Text("Does this match the PC screen once it links?", color = Muted, fontSize = 12.sp)
+                    Row(Modifier.padding(top = 12.dp)) {
+                        TextButton({ Relay.confirm(false) }) { Text("No", color = Bad) }
+                        Spacer(Modifier.weight(1f)); Button({ Relay.confirm(true) }) { Text("Yes, link") }
+                    }
+                } else if (st.token != null && left > 0) {
                     Text(st.token!!.chunked(3).joinToString("  "), color = Accent, fontSize = 44.sp, fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp))
                     Text("Expires in ${left}s", color = Muted, fontSize = 12.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
-                } else Primary("Generate token") {
-                    val i = VpnService.prepare(ctx); if (i != null) vpn.launch(i) else begin()
-                }
+                } else if (ready && authKey.trim().startsWith("tskey-")) Primary("Generate token") { begin() }
+                else Text(if (!ready) "Sign in to Tailscale first." else "Paste your auth key to continue.", color = Muted, fontSize = 12.sp)
             }
         } else {
             Panel("Linked to a PC", "Check this matches the fingerprint on the PC app.") {
                 Text(st.fingerprint, color = Ink, fontSize = 22.sp, fontFamily = FontFamily.Monospace)
                 Spacer(Modifier.height(8.dp))
-                Text("Tunnel: " + if (st.tunnelUp) "open" else "closed (opens when the PC asks)", color = Muted, fontSize = 13.sp)
+                if (st.tailnetIp != null) Text("Tailscale: connected · ${st.tailnetIp}", color = Muted, fontSize = 13.sp)
+                else { Text("Tailscale: signed out or off. The PC can't reach this phone.", color = Bad, fontSize = 13.sp); TextButton({ openTailscale() }) { Text("Open Tailscale", color = Accent) } }
                 Text("Last wake: ${st.lastWake}", color = Muted, fontSize = 13.sp)
                 TextButton({ Relay.unpair() }) { Text("Unlink", color = Bad) }
             }
