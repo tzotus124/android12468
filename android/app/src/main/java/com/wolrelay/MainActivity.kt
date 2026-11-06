@@ -122,6 +122,11 @@ private fun Screen() {
                 val ready = st.tailnetIp != null
                 if (!hasCred) {
                     Text("One-time setup: paste a Tailscale API access token (tskey-api-…, from admin console > Settings > Keys) or an OAuth client as clientId:clientSecret (scope auth_keys).", color = Muted, fontSize = 12.sp)
+                    val openUrl = { u: String -> runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }
+                    Row {
+                        TextButton({ openUrl("https://login.tailscale.com/admin/settings/keys") }) { Text("Generate API token ↗", color = Accent) }
+                        TextButton({ openUrl("https://login.tailscale.com/admin/settings/oauth") }) { Text("Or create OAuth client ↗", color = Accent) }
+                    }
                     OutlinedTextField(credIn, { credIn = it; credErr = null }, Modifier.fillMaxWidth().padding(top = 8.dp), label = { Text("API token or clientId:secret") },
                         singleLine = true, visualTransformation = PasswordVisualTransformation())
                     OutlinedTextField(tagIn, { tagIn = it }, Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp), label = { Text("Tag for the PC (e.g. tag:wake-pc; required for OAuth)") }, singleLine = true)
