@@ -53,6 +53,7 @@ private fun Screen() {
     LaunchedEffect(Unit) { while (true) { now = System.currentTimeMillis(); Relay.refreshTailnet(); delay(1000) } }
     var hasCred by remember { mutableStateOf(Prefs.tsCred.isNotEmpty()) }
     var credIn by remember { mutableStateOf("") }; var tagIn by remember { mutableStateOf(Prefs.tsTag) }; var credErr by remember { mutableStateOf<String?>(null) }
+    val begin = { Relay.generateToken(); RelayService.start(ctx) }
     val tsInstalled = { runCatching { ctx.packageManager.getPackageInfo(TS_PKG, 0); true }.getOrDefault(false) }
     val openTailscale = {
         val i = ctx.packageManager.getLaunchIntentForPackage(TS_PKG)
