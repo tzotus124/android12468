@@ -18,6 +18,9 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) { if (prefs(c).getBoolean("on", true)) c.startForegroundService(Intent(c, RelayService::class.java)) }
 }
 
+fun hmac(key: String, msg: String): String = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key.toByteArray(), "HmacSHA256")) }
+    .doFinal(msg.toByteArray()).joinToString("") { "%02x".format(it) }
+
 class RelayService : Service() {
     @Volatile private var running = false
     private var server: ServerSocket? = null
@@ -53,6 +56,11 @@ class RelayService : Service() {
             s.soTimeout = 8000
             val j = org.json.JSONObject(s.getInputStream().bufferedReader().readLine())
             val mac = j.optString("mac"); val ip = j.optString("ip")
+            // Token check: request must be signed with a secret from a PC token generated on this phone
+            val t = j.optString("ts"); val msg = "$t|$mac|$ip"
+            val secrets = prefs(this).getStringSet("secrets", emptySet()) ?: emptySet()
+            val fresh = Math.abs(System.currentTimeMillis() / 1000 - (t.toLongOrNull() ?: 0L)) <= 60
+            if (!fresh || secrets.none { hmac(it, msg) == j.optString("sig") }) return reply("DENIED (invalid token)")
             val m = mac.ifEmpty { arpLookup(ip) } ?: return reply("NEED_MAC (IP not in ARP cache, use MAC)")
             sendMagic(m, ip.ifEmpty { null }); reply("OK")
         } catch (e: Exception) { runCatching { reply("ERROR ${e.message}") } }
