@@ -57,10 +57,11 @@ class RelayService : Service() {
             val j = org.json.JSONObject(s.getInputStream().bufferedReader().readLine())
             val mac = j.optString("mac"); val ip = j.optString("ip")
             // Token check: request must be signed with a secret from a PC token generated on this phone
-            val t = j.optString("ts"); val msg = "$t|$mac|$ip"
+            val act = j.optString("action"); val t = j.optString("ts"); val msg = "$t|$mac|$ip|$act"
             val secrets = prefs(this).getStringSet("secrets", emptySet()) ?: emptySet()
             val fresh = Math.abs(System.currentTimeMillis() / 1000 - (t.toLongOrNull() ?: 0L)) <= 60
             if (!fresh || secrets.none { hmac(it, msg) == j.optString("sig") }) return reply("DENIED (invalid token)")
+            if (act == "ping") return reply("PONG|${Build.MODEL}")
             val m = mac.ifEmpty { arpLookup(ip) } ?: return reply("NEED_MAC (IP not in ARP cache, use MAC)")
             sendMagic(m, ip.ifEmpty { null }); reply("OK")
         } catch (e: Exception) { runCatching { reply("ERROR ${e.message}") } }
