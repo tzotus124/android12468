@@ -38,6 +38,7 @@ object Relay {
 
     fun init(ctx: Context) {
         app = ctx.applicationContext; Prefs.init(app)
+        if (Prefs.room.isNotEmpty() && Prefs.pcIp.isEmpty() && state.value.token == null) Prefs.clearPairing()  // unfinished token from a previous run
         state.update { it.copy(paired = Prefs.paired, fingerprint = fp(), tailnetIp = Tailnet.localIp()) }
     }
 
@@ -47,53 +48,35 @@ object Relay {
         it.copy(status = status ?: it.status, log = (listOf(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()) + "  " + msg) + it.log).take(40))
     }
 
-    // ---------- pairing: 6-digit token ----------
-    fun confirm(ok: Boolean) { confirmation?.complete(ok) }
-
-    /** Creates a single-use Tailscale auth key via the API, sends it (encrypted) to the PC once; it is never stored. */
-    fun startPairing() {
+    // ---------- linking: the phone shows one link token; the PC pastes it ----------
+    /**
+     * Creates a single-use, 10-minute Tailscale auth key via the API and packs it with this phone's tailnet IP and a fresh
+     * shared secret into one link token ("wr1." + base64url JSON). Nothing goes through any third-party server.
+     */
+    fun generateToken() {
         pairJob?.cancel()
         pairJob = scope.launch {
-            val job = currentCoroutineContext()[Job]!!
             try {
                 val phoneIp = Tailnet.localIp() ?: run { log("Sign in to Tailscale first", "Tailscale needed"); return@launch }
                 if (Prefs.tsCred.isEmpty()) { log("Add your Tailscale API credential first", "Setup needed"); return@launch }
                 state.update { it.copy(status = "Creating Tailscale key…") }
                 val authKey = try { TailscaleApi.createAuthKey(Prefs.tsCred, Prefs.tsTag) }
                     catch (e: CancellationException) { throw e } catch (e: Exception) { log("Key creation failed: ${e.message}", "Error"); return@launch }
-                val token = "%06d".format(SecureRandom().nextInt(1_000_000))
-                val roomBytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
-                val room = Base64.encodeToString(roomBytes, Base64.NO_WRAP)
-                val key = Crypto.pairKey(token); val topic = Crypto.pairTopic(token)
-                val t0 = System.currentTimeMillis(); val exp = t0 + 120_000
-                state.update { it.copy(token = token, tokenExpires = exp, pendingFp = null, status = "Waiting for the PC…") }
-                Ntfy.publish(topic, Crypto.seal(key, JSONObject().put("t", "offer").put("room", room)
-                    .put("ip", phoneIp).put("authkey", authKey).toString()))
-                var pcIp: String? = null
-                Ntfy.listen(topic, t0 / 1000 - 2, 10_000, exp, { job.isActive }) { m ->
-                    val p = Crypto.open(key, m.text)
-                    if (p != null && p.optString("t") == "answer") { pcIp = p.getString("ip"); true } else false
-                }
-                val pc = pcIp
-                if (pc == null) { state.update { it.copy(token = null, status = "Token expired") }; return@launch }
-                if (!runCatching { Tailnet.isTailnet(java.net.InetAddress.getByName(pc)) }.getOrDefault(false)) {
-                    state.update { it.copy(token = null) }; log("PC sent an invalid address", "Error"); return@launch
-                }
-                val d = CompletableDeferred<Boolean>(); confirmation = d
-                state.update { it.copy(token = null, pendingFp = Crypto.fingerprint(room, phoneIp, pc), status = "Confirm the PC") }
-                if (withTimeoutOrNull(120_000) { d.await() } != true) { state.update { it.copy(pendingFp = null, status = "Link cancelled") }; return@launch }
-                Prefs.room = room; Prefs.phoneIp = phoneIp; Prefs.pcIp = pc
-                state.update { it.copy(paired = true, pendingFp = null, fingerprint = fp(), status = "Linked") }
-                log("Linked with a PC")
-                start()
+                val room = Base64.encodeToString(ByteArray(32).also { SecureRandom().nextBytes(it) }, Base64.NO_WRAP)
+                val token = "wr1." + Base64.encodeToString(JSONObject().put("k", authKey).put("ip", phoneIp).put("r", room).toString().toByteArray(),
+                    Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+                Prefs.room = room; Prefs.phoneIp = phoneIp; Prefs.pcIp = ""
+                state.update { it.copy(token = token, tokenExpires = System.currentTimeMillis() + 600_000, status = "Waiting for the PC…") }
+                log("Link token ready")
             } catch (e: CancellationException) { throw e
-            } catch (e: Exception) { state.update { it.copy(token = null, pendingFp = null) }; log("Pairing failed: ${e.message}", "Error") }
+            } catch (e: Exception) { log("Failed: ${e.message}", "Error") }
         }
     }
 
+    /** Cancels a waiting token or unlinks the current PC. */
     fun unpair() {
         pairJob?.cancel(); Prefs.clearPairing()
-        state.update { it.copy(paired = false, token = null, pendingFp = null, fingerprint = "", status = "Idle") }
+        state.update { it.copy(paired = false, token = null, fingerprint = "", status = "Idle") }
     }
 
     // ---------- always-on listener (runs inside the foreground service) ----------
@@ -102,17 +85,18 @@ object Relay {
         state.update { it.copy(running = true, status = "Listening") }
         loopJob = scope.launch {
             while (isActive) {
-                if (!Prefs.paired) { delay(2000); continue }
+                if (Prefs.room.isEmpty()) { delay(2000); continue }
                 try {
                     ServerSocket(CMD_PORT).use { ss ->
                         ss.soTimeout = 3000
-                        while (isActive && Prefs.paired) {
+                        while (isActive && Prefs.room.isNotEmpty()) {
                             val c = try { ss.accept() } catch (_: SocketTimeoutException) { continue }
                             c.use {
-                                // Only the paired PC's tailnet address, and only correctly signed commands.
-                                if (it.inetAddress.hostAddress != Prefs.pcIp) return@use
+                                // Only tailnet addresses (the paired PC once known), and only correctly signed commands.
+                                val src = it.inetAddress
+                                if (!Tailnet.isTailnet(src) || (Prefs.pcIp.isNotEmpty() && src.hostAddress != Prefs.pcIp)) return@use
                                 it.soTimeout = 5000
-                                val reply = try { handle(it.getInputStream().bufferedReader().readLine()) }
+                                val reply = try { handle(it.getInputStream().bufferedReader().readLine(), src.hostAddress!!) }
                                 catch (e: Exception) { JSONObject().put("ok", false).put("err", e.message ?: "error") }
                                 it.getOutputStream().write((reply.toString() + "\n").toByteArray())
                             }
@@ -126,13 +110,18 @@ object Relay {
 
     fun stop() { loopJob?.cancel(); loopJob = null; state.update { it.copy(running = false, status = "Stopped") } }
 
-    private fun handle(line: String): JSONObject {
+    private fun handle(line: String, from: String): JSONObject {
         fun fail(e: String) = JSONObject().put("ok", false).put("err", e)
         val j = JSONObject(line)
         val ts = j.optLong("ts"); val cmd = j.optString("cmd"); var mac = j.optString("mac"); val ip = j.optString("ip")
         val expect = Crypto.hmacHex(Crypto.sigKey(Base64.decode(Prefs.room, Base64.NO_WRAP)), "$cmd|$mac|$ip|$ts")
         if (abs(System.currentTimeMillis() / 1000 - ts) > 120 ||
             !MessageDigest.isEqual(expect.toByteArray(), j.optString("sig").toByteArray())) return fail("unauthorized")
+        if (Prefs.pcIp.isEmpty()) {  // first valid signed message completes the link and pins the PC's address
+            Prefs.pcIp = from
+            state.update { it.copy(paired = true, token = null, fingerprint = fp(), status = "Linked") }; log("Linked with PC $from")
+        }
+        if (cmd == "hello") return JSONObject().put("ok", true)
         if (cmd != "wake") return fail("bad_cmd")
         if (mac.isEmpty() && ip.isNotEmpty()) mac = WakeOnLan.arpLookup(ip) ?: return fail("unknown_mac")
         if (!Regex("^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$").matches(mac)) return fail("bad_mac")
