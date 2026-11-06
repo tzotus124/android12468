@@ -15,7 +15,7 @@ import java.util.*
 import kotlin.math.abs
 
 data class UiState(
-    val paired: Boolean = false, val token: String? = null, val tokenExpires: Long = 0, val pendingFp: String? = null,
+    val paired: Boolean = false, val linking: Boolean = false, val openUrl: String? = null, val lastUrl: String? = null,
     val status: String = "Idle", val tailnetIp: String? = null, val fingerprint: String = "",
     val lastWake: String = "No wakes yet", val running: Boolean = false, val log: List<String> = emptyList(),
 )
@@ -38,7 +38,7 @@ object Relay {
 
     fun init(ctx: Context) {
         app = ctx.applicationContext; Prefs.init(app)
-        if (Prefs.room.isNotEmpty() && Prefs.pcIp.isEmpty() && state.value.token == null) Prefs.clearPairing()  // unfinished token from a previous run
+        if (Prefs.room.isNotEmpty() && Prefs.pcIp.isEmpty() && !state.value.linking) Prefs.clearPairing()  // unfinished token from a previous run
         state.update { it.copy(paired = Prefs.paired, fingerprint = fp(), tailnetIp = Tailnet.localIp()) }
     }
 
@@ -48,35 +48,38 @@ object Relay {
         it.copy(status = status ?: it.status, log = (listOf(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()) + "  " + msg) + it.log).take(40))
     }
 
-    // ---------- linking: the phone shows one link token; the PC pastes it ----------
-    /**
-     * Creates a single-use, 10-minute Tailscale auth key via the API and packs it with this phone's tailnet IP and a fresh
-     * shared secret into one link token ("wr1." + base64url JSON). Nothing goes through any third-party server.
-     */
-    fun generateToken() {
+    // ---------- linking: the PC shows a 6-digit code + a Tailscale sign-in link; the phone enters the code and approves ----------
+    fun urlOpened() { state.update { it.copy(openUrl = null) } }
+
+    /** Reads the PC's offer (shared secret + Tailscale approval link) from the code, answers with this phone's tailnet IP. */
+    fun linkWithCode(code: String) {
         pairJob?.cancel()
         pairJob = scope.launch {
+            val job = currentCoroutineContext()[Job]!!
             try {
                 val phoneIp = Tailnet.localIp() ?: run { log("Sign in to Tailscale first", "Tailscale needed"); return@launch }
-                if (BuildConfig.TS_CRED.isEmpty()) { log("This build has no Tailscale credential (set the TS_OAUTH secret and rebuild)", "Build setup needed"); return@launch }
-                state.update { it.copy(status = "Creating Tailscale key…") }
-                val authKey = try { TailscaleApi.createAuthKey(BuildConfig.TS_CRED, if (BuildConfig.TS_CRED.startsWith("tskey-api-")) "" else BuildConfig.TS_TAG) }
-                    catch (e: CancellationException) { throw e } catch (e: Exception) { log("Key creation failed: ${e.message}", "Error"); return@launch }
-                val room = Base64.encodeToString(ByteArray(32).also { SecureRandom().nextBytes(it) }, Base64.NO_WRAP)
-                val token = "wr1." + Base64.encodeToString(JSONObject().put("k", authKey).put("ip", phoneIp).put("r", room).toString().toByteArray(),
-                    Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+                state.update { it.copy(status = "Looking for the PC…") }
+                val key = Crypto.pairKey(code); val topic = Crypto.pairTopic(code)
+                var offer: JSONObject? = null
+                Ntfy.listen(topic, nowSec() - 130, 10_000, System.currentTimeMillis() + 20_000, { job.isActive }) { m ->
+                    val p = Crypto.open(key, m.text)
+                    if (p != null && p.optString("t") == "offer" && nowSec() - m.time <= 130) { offer = p; true } else false
+                }
+                val o = offer ?: run { log("Wrong or expired code. Check the PC screen.", "Not found"); return@launch }
+                val room = o.getString("room"); val url = o.optString("url").takeIf { it.startsWith("https://login.tailscale.com/") }
                 Prefs.room = room; Prefs.phoneIp = phoneIp; Prefs.pcIp = ""
-                state.update { it.copy(token = token, tokenExpires = System.currentTimeMillis() + 600_000, status = "Waiting for the PC…") }
-                log("Link token ready")
+                Ntfy.publish(topic, Crypto.seal(key, JSONObject().put("t", "answer").put("ip", phoneIp).toString()))
+                state.update { it.copy(linking = true, openUrl = url, lastUrl = url, status = if (url != null) "Approve the PC in the browser" else "Linking…") }
+                log(if (url != null) "Approve the PC in the page that opened" else "PC is already signed in; linking")
             } catch (e: CancellationException) { throw e
-            } catch (e: Exception) { log("Failed: ${e.message}", "Error") }
+            } catch (e: Exception) { log("Linking failed: ${e.message}", "Error") }
         }
     }
 
-    /** Cancels a waiting token or unlinks the current PC. */
+    /** Cancels a link in progress or unlinks the current PC. */
     fun unpair() {
         pairJob?.cancel(); Prefs.clearPairing()
-        state.update { it.copy(paired = false, token = null, fingerprint = "", status = "Idle") }
+        state.update { it.copy(paired = false, linking = false, openUrl = null, lastUrl = null, fingerprint = "", status = "Idle") }
     }
 
     // ---------- always-on listener (runs inside the foreground service) ----------
@@ -119,7 +122,7 @@ object Relay {
             !MessageDigest.isEqual(expect.toByteArray(), j.optString("sig").toByteArray())) return fail("unauthorized")
         if (Prefs.pcIp.isEmpty()) {  // first valid signed message completes the link and pins the PC's address
             Prefs.pcIp = from
-            state.update { it.copy(paired = true, token = null, fingerprint = fp(), status = "Linked") }; log("Linked with PC $from")
+            state.update { it.copy(paired = true, linking = false, openUrl = null, fingerprint = fp(), status = "Linked") }; log("Linked with PC $from")
         }
         if (cmd == "hello") return JSONObject().put("ok", true)
         if (cmd != "wake") return fail("bad_cmd")

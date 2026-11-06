@@ -26,7 +26,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -51,7 +50,11 @@ private fun Screen() {
     val st by Relay.state.collectAsState()
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) { while (true) { now = System.currentTimeMillis(); Relay.refreshTailnet(); delay(1000) } }
-    val begin = { Relay.generateToken(); RelayService.start(ctx) }
+    val begin = { Relay.linkWithCode(code); RelayService.start(ctx) }
+    var code by remember { mutableStateOf("") }
+    LaunchedEffect(st.openUrl) {  // open Tailscale's approval page for the PC (your browser is usually already signed in)
+        st.openUrl?.let { u -> runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }; Relay.urlOpened() }
+    }
     val tsInstalled = { runCatching { ctx.packageManager.getPackageInfo(TS_PKG, 0); true }.getOrDefault(false) }
     val openTailscale = {
         val i = ctx.packageManager.getLaunchIntentForPackage(TS_PKG)
@@ -108,24 +111,20 @@ private fun Screen() {
                 else if (!tsInstalled()) Primary("Install Tailscale") { openTailscale() }
                 else Primary("Open Tailscale to sign in") { openTailscale() }
             }
-            Panel("2. Link a PC", "Tap Generate token. The app creates a one-time Tailscale key for the PC and shows a link token. Paste that token into the PC app. It expires in 10 minutes.") {
+            Panel("2. Link a PC", "On the PC app press Start. It shows a 6-digit code. Enter it here, then approve the PC in the Tailscale page that opens. No keys or tokens needed.") {
                 val ready = st.tailnetIp != null
-                val left = ((st.tokenExpires - now) / 1000).coerceAtLeast(0)
-                if (st.token != null && left > 0) {
-                    Text("Copy this token and paste it into the PC app.", color = Muted, fontSize = 12.sp)
-                    Text(st.token!!, color = Accent, fontSize = 12.sp, fontFamily = FontFamily.Monospace, maxLines = 6,
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp).clip(RoundedCornerShape(10.dp)).background(Bg).padding(10.dp))
-                    Row {
-                        Button({
-                            ctx.getSystemService(android.content.ClipboardManager::class.java)
-                                .setPrimaryClip(android.content.ClipData.newPlainText("Wake Relay link token", st.token!!))
-                            android.widget.Toast.makeText(ctx, "Token copied", android.widget.Toast.LENGTH_SHORT).show()
-                        }) { Text("Copy token") }
+                if (st.linking) {
+                    Text("Approve the PC in your browser. This phone links automatically once the PC is online.", color = Muted, fontSize = 13.sp)
+                    Row(Modifier.padding(top = 8.dp)) {
+                        st.lastUrl?.let { u -> TextButton({ runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }) { Text("Open approval page", color = Accent) } }
                         Spacer(Modifier.weight(1f)); TextButton({ Relay.unpair() }) { Text("Cancel", color = Bad) }
                     }
-                    Text("Waiting for the PC… key expires in ${left / 60}:%02d".format(left % 60), color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
                 } else {
-                    if (ready) Primary("Generate token") { begin() } else Text("Sign in to Tailscale first.", color = Muted, fontSize = 12.sp)
+                    OutlinedTextField(code, { v -> code = v.filter { it.isDigit() }.take(6) }, Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                        label = { Text("6-digit code from the PC") }, singleLine = true,
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword))
+                    if (ready && code.length == 6) Primary("Link") { begin() }
+                    else Text(if (!ready) "Sign in to Tailscale first." else "Enter the code shown on the PC.", color = Muted, fontSize = 12.sp)
                 }
             }
         } else {
