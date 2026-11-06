@@ -41,6 +41,14 @@ fun createAuthKey(api: String): String {
 }
 
 class MainActivity : ComponentActivity() {
+    private var clipKey by mutableStateOf<String?>(null)
+    override fun onWindowFocusChanged(f: Boolean) {
+        super.onWindowFocusChanged(f)
+        if (!f) return
+        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        val t = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.trim()
+        if (t != null && t.startsWith("tskey-api-")) { clipKey = t; if (Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip() }
+    }
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 0)
@@ -85,6 +93,22 @@ class MainActivity : ComponentActivity() {
             }
         }
         val ready = installed && ip != null && batt
+        val generate: () -> Unit = {
+            msg = "Generating…"; pcToken = ""
+            Thread { try {
+                val myIp = tailscaleIp() ?: throw Exception("Tailscale is not connected on this phone")
+                val key = createAuthKey(apiKey.trim())
+                val sec = java.util.UUID.randomUUID().toString().replace("-", "").take(24)
+                val old = prefs(this@MainActivity).getStringSet("secrets", emptySet()) ?: emptySet()
+                prefs(this@MainActivity).edit().putStringSet("secrets", HashSet(old) + sec).apply()
+                pcToken = "$key~$sec~$myIp"; msg = "Done. Paste this token into the PC app."
+            } catch (e: Exception) {
+                if (e.message?.contains("HTTP 401") == true || e.message?.contains("HTTP 403") == true) {
+                    apiKey = ""; prefs(this@MainActivity).edit().remove("api").apply()
+                    msg = "Tailscale access expired. Tap the button to sign in again."
+                } else msg = "Failed: ${e.message}" } }.start()
+        }
+        LaunchedEffect(clipKey) { clipKey?.let { apiKey = it; prefs(this@MainActivity).edit().putString("api", it).apply(); clipKey = null; generate() } }
 
         Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF0B1020), Color(0xFF1A1440))))
             .statusBarsPadding().verticalScroll(rememberScrollState()).padding(20.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -99,21 +123,13 @@ class MainActivity : ComponentActivity() {
             } else Card { Text("✔ Setup complete", color = Color(0xFF22C55E), fontWeight = FontWeight.SemiBold) }
             Card {
                 Text("PC token", color = Color.White, fontWeight = FontWeight.SemiBold)
-                Text("Generate a token and paste it into the PC app. The PC cannot reach this phone without it. Needs your Tailscale API access token (login.tailscale.com/admin/settings/keys).",
+                Text("Generates the token your PC needs to connect. First time only: the app opens Tailscale so you can sign in and copy an access token; it picks it up automatically.",
                     color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(vertical = 6.dp))
-                OutlinedTextField(apiKey, { apiKey = it; prefs(this@MainActivity).edit().putString("api", it).apply() },
-                    label = { Text("Tailscale API access token") }, singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(10.dp))
-                Button({ msg = "Generating…"; pcToken = ""
-                    Thread { try { val myIp = tailscaleIp() ?: throw Exception("Tailscale is not connected on this phone")
-                        val key = createAuthKey(apiKey.trim())
-                        val sec = java.util.UUID.randomUUID().toString().replace("-", "").take(24)
-                        val old = prefs(this@MainActivity).getStringSet("secrets", emptySet()) ?: emptySet()
-                        prefs(this@MainActivity).edit().putStringSet("secrets", HashSet(old) + sec).apply()
-                        pcToken = "$key~$sec~$myIp"; msg = "Paste this into the PC app within 1 hour." }
-                        catch (e: Exception) { msg = "Failed: ${e.message}" } }.start() },
-                    Modifier.fillMaxWidth(), enabled = apiKey.isNotBlank()) { Text("Generate PC token") }
+                Button({ if (apiKey.isBlank()) {
+                        msg = "Sign in, tap \"Generate access token\", then Copy. Come back here and I'll finish automatically."
+                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://login.tailscale.com/admin/settings/keys")))
+                    } else generate() },
+                    Modifier.fillMaxWidth()) { Text(if (apiKey.isBlank()) "Get access from Tailscale & generate token" else "Generate PC token") }
                 if (msg.isNotEmpty()) Text(msg, color = Color(0xFF9DB2FF), modifier = Modifier.padding(top = 8.dp))
                 OutlinedButton({ prefs(this@MainActivity).edit().remove("secrets").apply(); pcToken = ""; msg = "All PCs unpaired." },
                     Modifier.fillMaxWidth()) { Text("Unpair all PCs") }
