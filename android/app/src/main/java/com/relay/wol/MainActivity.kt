@@ -7,6 +7,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -85,7 +87,7 @@ class MainActivity : ComponentActivity() {
         val ready = installed && ip != null && batt
 
         Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF0B1020), Color(0xFF1A1440))))
-            .padding(20.dp).statusBarsPadding(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            .statusBarsPadding().verticalScroll(rememberScrollState()).padding(20.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Text("⏻ WoL Relay", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White)
             if (!ready) Card {
                 Text("Setup", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
@@ -95,22 +97,6 @@ class MainActivity : ComponentActivity() {
                 StepRow(ip != null, "Sign in to Tailscale", "Sign in", installed) { openTs() }
                 StepRow(batt, "Keep relay always on", "Allow", true) { askBattery() }
             } else Card { Text("✔ Setup complete", color = Color(0xFF22C55E), fontWeight = FontWeight.SemiBold) }
-            Card {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Relay service", color = Color.White, fontWeight = FontWeight.SemiBold)
-                        Text(if (on) "Running in background" else "Stopped", color = if (on) Color(0xFF22C55E) else Color(0xFFEF4444))
-                    }
-                    Switch(on, { on = it; prefs(this@MainActivity).edit().putBoolean("on", it).apply()
-                        val i = Intent(this@MainActivity, RelayService::class.java)
-                        if (it) startForegroundService(i) else stopService(i) })
-                }
-            }
-            Card {
-                Text("Tailscale", color = Color.White, fontWeight = FontWeight.SemiBold)
-                Text(if (ip != null) "● Connected  $ip" else "● Not connected", color = if (ip != null) Color(0xFF22C55E) else Color(0xFFF59E0B))
-                Text("Your PC finds this phone automatically (port $PORT). No pairing needed.", color = Color(0xFF9DB2FF), modifier = Modifier.padding(top = 8.dp))
-            }
             Card {
                 Text("PC token", color = Color.White, fontWeight = FontWeight.SemiBold)
                 Text("Generate a token and paste it into the PC app. The PC cannot reach this phone without it. Needs your Tailscale API access token (login.tailscale.com/admin/settings/keys).",
@@ -136,6 +122,22 @@ class MainActivity : ComponentActivity() {
                     OutlinedButton({ (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("t", pcToken)) },
                         Modifier.fillMaxWidth()) { Text("Copy token") }
                 }
+            }
+            Card {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Relay service", color = Color.White, fontWeight = FontWeight.SemiBold)
+                        Text(if (on) "Running in background" else "Stopped", color = if (on) Color(0xFF22C55E) else Color(0xFFEF4444))
+                    }
+                    Switch(on, { on = it; prefs(this@MainActivity).edit().putBoolean("on", it).apply()
+                        val i = Intent(this@MainActivity, RelayService::class.java)
+                        if (it) startForegroundService(i) else stopService(i) })
+                }
+            }
+            Card {
+                Text("Tailscale", color = Color.White, fontWeight = FontWeight.SemiBold)
+                Text(if (ip != null) "● Connected  $ip" else "● Not connected", color = if (ip != null) Color(0xFF22C55E) else Color(0xFFF59E0B))
+                Text("Link your PC with a token: generate one in the PC token card above and paste it into the PC app.", color = Color(0xFF9DB2FF), modifier = Modifier.padding(top = 8.dp))
             }
         }
     }
