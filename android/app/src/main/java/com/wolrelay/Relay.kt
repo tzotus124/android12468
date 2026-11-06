@@ -58,9 +58,9 @@ object Relay {
         pairJob = scope.launch {
             try {
                 val phoneIp = Tailnet.localIp() ?: run { log("Sign in to Tailscale first", "Tailscale needed"); return@launch }
-                if (Prefs.tsCred.isEmpty()) { log("Add your Tailscale API credential first", "Setup needed"); return@launch }
+                if (BuildConfig.TS_CRED.isEmpty()) { log("This build has no Tailscale credential (set the TS_OAUTH secret and rebuild)", "Build setup needed"); return@launch }
                 state.update { it.copy(status = "Creating Tailscale key…") }
-                val authKey = try { TailscaleApi.createAuthKey(Prefs.tsCred, Prefs.tsTag) }
+                val authKey = try { TailscaleApi.createAuthKey(BuildConfig.TS_CRED, if (BuildConfig.TS_CRED.startsWith("tskey-api-")) "" else BuildConfig.TS_TAG) }
                     catch (e: CancellationException) { throw e } catch (e: Exception) { log("Key creation failed: ${e.message}", "Error"); return@launch }
                 val room = Base64.encodeToString(ByteArray(32).also { SecureRandom().nextBytes(it) }, Base64.NO_WRAP)
                 val token = "wr1." + Base64.encodeToString(JSONObject().put("k", authKey).put("ip", phoneIp).put("r", room).toString().toByteArray(),

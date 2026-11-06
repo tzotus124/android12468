@@ -51,8 +51,6 @@ private fun Screen() {
     val st by Relay.state.collectAsState()
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) { while (true) { now = System.currentTimeMillis(); Relay.refreshTailnet(); delay(1000) } }
-    var hasCred by remember { mutableStateOf(Prefs.tsCred.isNotEmpty()) }
-    var credIn by remember { mutableStateOf("") }; var tagIn by remember { mutableStateOf(Prefs.tsTag) }; var credErr by remember { mutableStateOf<String?>(null) }
     val begin = { Relay.generateToken(); RelayService.start(ctx) }
     val tsInstalled = { runCatching { ctx.packageManager.getPackageInfo(TS_PKG, 0); true }.getOrDefault(false) }
     val openTailscale = {
@@ -112,24 +110,8 @@ private fun Screen() {
             }
             Panel("2. Link a PC", "Tap Generate token. The app creates a one-time Tailscale key for the PC and shows a link token. Paste that token into the PC app. It expires in 10 minutes.") {
                 val ready = st.tailnetIp != null
-                if (!hasCred) {
-                    Text("One-time setup: paste a Tailscale API access token (tskey-api-…, from admin console > Settings > Keys) or an OAuth client as clientId:clientSecret (scope auth_keys).", color = Muted, fontSize = 12.sp)
-                    val openUrl = { u: String -> runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }
-                    Row {
-                        TextButton({ openUrl("https://login.tailscale.com/admin/settings/keys") }) { Text("Generate API token ↗", color = Accent) }
-                        TextButton({ openUrl("https://login.tailscale.com/admin/settings/oauth") }) { Text("Or create OAuth client ↗", color = Accent) }
-                    }
-                    OutlinedTextField(credIn, { credIn = it; credErr = null }, Modifier.fillMaxWidth().padding(top = 8.dp), label = { Text("API token or clientId:secret") },
-                        singleLine = true, visualTransformation = PasswordVisualTransformation())
-                    OutlinedTextField(tagIn, { tagIn = it }, Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp), label = { Text("Tag for the PC (e.g. tag:wake-pc; required for OAuth)") }, singleLine = true)
-                    credErr?.let { Text(it, color = Bad, fontSize = 12.sp) }
-                    Primary("Save") {
-                        val c = credIn.trim(); val err = TailscaleApi.validate(c)
-                        if (err != null) credErr = err else { Prefs.tsCred = c; Prefs.tsTag = tagIn.trim(); credIn = ""; hasCred = true }
-                    }
-                }
                 val left = ((st.tokenExpires - now) / 1000).coerceAtLeast(0)
-                if (!hasCred) { /* setup form above */ } else if (st.token != null && left > 0) {
+                if (st.token != null && left > 0) {
                     Text("Copy this token and paste it into the PC app.", color = Muted, fontSize = 12.sp)
                     Text(st.token!!, color = Accent, fontSize = 12.sp, fontFamily = FontFamily.Monospace, maxLines = 6,
                         modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp).clip(RoundedCornerShape(10.dp)).background(Bg).padding(10.dp))
@@ -144,7 +126,6 @@ private fun Screen() {
                     Text("Waiting for the PC… key expires in ${left / 60}:%02d".format(left % 60), color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
                 } else {
                     if (ready) Primary("Generate token") { begin() } else Text("Sign in to Tailscale first.", color = Muted, fontSize = 12.sp)
-                    TextButton({ Prefs.tsCred = ""; hasCred = false }) { Text("Change Tailscale credential", color = Muted) }
                 }
             }
         } else {
