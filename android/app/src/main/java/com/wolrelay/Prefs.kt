@@ -12,6 +12,9 @@ object Prefs {
     var phoneIp: String get() = get("phoneIp"); set(v) = put("phoneIp", v)
     var pcIp: String get() = get("pcIp"); set(v) = put("pcIp", v)
     var tsBatteryAsked: Boolean get() = get("tsBat") == "1"; set(v) = put("tsBat", if (v) "1" else "")
+    /** Tailscale API credential, stored encrypted with a Keystore key. */
+    var tsCred: String get() = Secure.decrypt(get("tsCred")) ?: ""; set(v) = put("tsCred", if (v.isEmpty()) "" else Secure.encrypt(v))
+    var tsTag: String get() = get("tsTag"); set(v) = put("tsTag", v)
     val paired get() = room.isNotEmpty() && pcIp.isNotEmpty()
     fun clearPairing() = sp.edit().remove("room").remove("phoneIp").remove("pcIp").apply()
 }

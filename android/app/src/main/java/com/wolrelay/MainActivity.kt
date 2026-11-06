@@ -51,9 +51,17 @@ private fun Screen() {
     val st by Relay.state.collectAsState()
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) { while (true) { now = System.currentTimeMillis(); Relay.refreshTailnet(); delay(1000) } }
-    var authKey by remember { mutableStateOf("") }
+    var hasCred by remember { mutableStateOf(Prefs.tsCred.isNotEmpty()) }
+    var credIn by remember { mutableStateOf("") }; var tagIn by remember { mutableStateOf(Prefs.tsTag) }; var credErr by remember { mutableStateOf<String?>(null) }
+    // Whenever a pairing token is generated, copy it to the clipboard automatically.
+    LaunchedEffect(st.token) {
+        st.token?.let { t ->
+            val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("Wake Relay token", t))
+        }
+    }
 
-    val begin = { Relay.startPairing(authKey); RelayService.start(ctx); authKey = "" }
+    val begin = { Relay.startPairing(); RelayService.start(ctx) }
     val tsInstalled = { runCatching { ctx.packageManager.getPackageInfo(TS_PKG, 0); true }.getOrDefault(false) }
     val openTailscale = {
         val i = ctx.packageManager.getLaunchIntentForPackage(TS_PKG)
@@ -110,12 +118,21 @@ private fun Screen() {
                 else if (!tsInstalled()) Primary("Install Tailscale") { openTailscale() }
                 else Primary("Open Tailscale to sign in") { openTailscale() }
             }
-            Panel("2. Link a PC", "Paste a Tailscale auth key (admin console > Settings > Keys; one-off, pre-approved, short expiry). It lets the PC join without any login. Then tap Generate token and type the 6 digits into the PC app.") {
+            Panel("2. Link a PC", "Tap Generate token. The app creates a one-time Tailscale key for the PC automatically, copies the 6-digit token to your clipboard, and shows it here. Type it into the PC app.") {
                 val ready = st.tailnetIp != null
-                if (st.token == null && st.pendingFp == null) OutlinedTextField(authKey, { authKey = it }, Modifier.fillMaxWidth().padding(bottom = 12.dp),
-                    label = { Text("tskey-auth-…") }, singleLine = true, enabled = ready, visualTransformation = PasswordVisualTransformation())
+                if (!hasCred) {
+                    Text("One-time setup: paste a Tailscale API access token (tskey-api-…, from admin console > Settings > Keys) or an OAuth client as clientId:clientSecret (scope auth_keys).", color = Muted, fontSize = 12.sp)
+                    OutlinedTextField(credIn, { credIn = it; credErr = null }, Modifier.fillMaxWidth().padding(top = 8.dp), label = { Text("API token or clientId:secret") },
+                        singleLine = true, visualTransformation = PasswordVisualTransformation())
+                    OutlinedTextField(tagIn, { tagIn = it }, Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp), label = { Text("Tag for the PC (e.g. tag:wake-pc; required for OAuth)") }, singleLine = true)
+                    credErr?.let { Text(it, color = Bad, fontSize = 12.sp) }
+                    Primary("Save") {
+                        val c = credIn.trim(); val err = TailscaleApi.validate(c)
+                        if (err != null) credErr = err else { Prefs.tsCred = c; Prefs.tsTag = tagIn.trim(); credIn = ""; hasCred = true }
+                    }
+                }
                 val left = ((st.tokenExpires - now) / 1000).coerceAtLeast(0)
-                if (st.pendingFp != null) {
+                if (!hasCred) { /* setup form above */ } else if (st.pendingFp != null) {
                     Text("PC fingerprint", color = Muted, fontSize = 12.sp)
                     Text(st.pendingFp!!, color = Accent, fontSize = 26.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(vertical = 8.dp))
                     Text("Does this match the PC screen once it links?", color = Muted, fontSize = 12.sp)
@@ -127,8 +144,10 @@ private fun Screen() {
                     Text(st.token!!.chunked(3).joinToString("  "), color = Accent, fontSize = 44.sp, fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp))
                     Text("Expires in ${left}s", color = Muted, fontSize = 12.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
-                } else if (ready && authKey.trim().startsWith("tskey-")) Primary("Generate token") { begin() }
-                else Text(if (!ready) "Sign in to Tailscale first." else "Paste your auth key to continue.", color = Muted, fontSize = 12.sp)
+                } else {
+                    if (ready) Primary("Generate token") { begin() } else Text("Sign in to Tailscale first.", color = Muted, fontSize = 12.sp)
+                    TextButton({ Prefs.tsCred = ""; hasCred = false }) { Text("Change Tailscale credential", color = Muted) }
+                }
             }
         } else {
             Panel("Linked to a PC", "Check this matches the fingerprint on the PC app.") {

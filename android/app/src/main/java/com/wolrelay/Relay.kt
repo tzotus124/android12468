@@ -50,13 +50,17 @@ object Relay {
     // ---------- pairing: 6-digit token ----------
     fun confirm(ok: Boolean) { confirmation?.complete(ok) }
 
-    /** [authKey] is a Tailscale pre-auth key. It is sent (encrypted) to the PC once and never stored on the phone. */
-    fun startPairing(authKey: String) {
+    /** Creates a single-use Tailscale auth key via the API, sends it (encrypted) to the PC once; it is never stored. */
+    fun startPairing() {
         pairJob?.cancel()
         pairJob = scope.launch {
             val job = currentCoroutineContext()[Job]!!
             try {
                 val phoneIp = Tailnet.localIp() ?: run { log("Sign in to Tailscale first", "Tailscale needed"); return@launch }
+                if (Prefs.tsCred.isEmpty()) { log("Add your Tailscale API credential first", "Setup needed"); return@launch }
+                state.update { it.copy(status = "Creating Tailscale key…") }
+                val authKey = try { TailscaleApi.createAuthKey(Prefs.tsCred, Prefs.tsTag) }
+                    catch (e: CancellationException) { throw e } catch (e: Exception) { log("Key creation failed: ${e.message}", "Error"); return@launch }
                 val token = "%06d".format(SecureRandom().nextInt(1_000_000))
                 val roomBytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
                 val room = Base64.encodeToString(roomBytes, Base64.NO_WRAP)
@@ -64,7 +68,7 @@ object Relay {
                 val t0 = System.currentTimeMillis(); val exp = t0 + 120_000
                 state.update { it.copy(token = token, tokenExpires = exp, pendingFp = null, status = "Waiting for the PC…") }
                 Ntfy.publish(topic, Crypto.seal(key, JSONObject().put("t", "offer").put("room", room)
-                    .put("ip", phoneIp).put("authkey", authKey.trim()).toString()))
+                    .put("ip", phoneIp).put("authkey", authKey).toString()))
                 var pcIp: String? = null
                 Ntfy.listen(topic, t0 / 1000 - 2, 10_000, exp, { job.isActive }) { m ->
                     val p = Crypto.open(key, m.text)
