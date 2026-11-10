@@ -5,12 +5,13 @@ import android.os.*
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -22,9 +23,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
-import android.text.format.DateUtils
 import kotlinx.coroutines.delay
 import java.net.HttpURLConnection
 import java.net.URL
@@ -77,43 +76,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** One approved PC: its name (sent by WoL Remote), when it last connected, its wake PIN state, and the Set PIN / Remove buttons. */
-    @Composable fun PcRow(p: Pc, onPin: () -> Unit, onRemove: () -> Unit) {
-        Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-            Text(p.name, color = Color.White, fontWeight = FontWeight.SemiBold)
-            Text(if (p.lastSeen == 0L) "Approved · waiting for its first connection"
-                else "Last seen " + DateUtils.getRelativeTimeSpanString(p.lastSeen, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS) + (if (p.lastIp.isNotEmpty()) " · ${p.lastIp}" else ""),
-                color = Color.Gray, fontSize = 12.sp)
-            Text(if (p.hasPin) "🔒 Wake PIN set · ${p.unlocked} PC(s) unlocked" else "⚠ No wake PIN: this PC can wake any MAC address",
-                color = if (p.hasPin) Color(0xFF22C55E) else Color(0xFFF59E0B), fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp, bottom = 6.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onPin, Modifier.weight(1f)) { Text(if (p.hasPin) "Change PIN" else "Set PIN") }
-                OutlinedButton(onRemove, Modifier.weight(1f)) { Text("Remove") }
-            }
-        }
-    }
-
-    @Composable fun PinDialog(p: Pc, onDone: () -> Unit) {
-        var pin by remember { mutableStateOf("") }
-        var pin2 by remember { mutableStateOf("") }
-        val ok = Pcs.validPin(pin) && pin == pin2
-        AlertDialog(onDismissRequest = onDone,
-            title = { Text("Wake PIN for ${p.name}") },
-            text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("This PC will have to enter this PIN the first time it wakes each PC (by MAC address). 4 to 16 digits. Changing the PIN asks again for every PC.", fontSize = 13.sp)
-                OutlinedTextField(pin, { pin = it.filter(Char::isDigit).take(16) }, label = { Text("New PIN") }, singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword))
-                OutlinedTextField(pin2, { pin2 = it.filter(Char::isDigit).take(16) }, label = { Text("Repeat PIN") }, singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    isError = pin2.isNotEmpty() && pin != pin2)
-            } },
-            confirmButton = { TextButton({ Pcs.setPin(this@MainActivity, p.secret, pin); onDone() }, enabled = ok) { Text("Save PIN") } },
-            dismissButton = { Row {
-                if (p.hasPin) TextButton({ Pcs.clearPin(this@MainActivity, p.secret); onDone() }) { Text("Remove PIN", color = Color(0xFFEF4444)) }
-                TextButton(onDone) { Text("Cancel") }
-            } })
-    }
-
     @Composable fun Screen() {
         var installed by remember { mutableStateOf(tsInstalled()) }
         var ip by remember { mutableStateOf<String?>(null) }
@@ -123,12 +85,14 @@ class MainActivity : ComponentActivity() {
         var pcToken by remember { mutableStateOf("") }
         var msg by remember { mutableStateOf("") }
         var log by remember { mutableStateOf(loadLog(this)) }
-        var pcs by remember { mutableStateOf(Pcs.list(this)) }
-        var pinFor by remember { mutableStateOf<String?>(null) }       // secret of the PC whose PIN dialog is open
-        var removeFor by remember { mutableStateOf<String?>(null) }    // secret of the PC awaiting remove confirmation
+        var clients by remember { mutableStateOf(loadClients(this)) }
+        var page by rememberSaveable { mutableStateOf("home") }     // home | approved | logs
+        var confirmRemove by remember { mutableStateOf<Client?>(null) }
+        var openId by rememberSaveable { mutableStateOf("") }       // secret of the expanded client row
+        BackHandler(page != "home") { page = "home" }
         var tried by rememberSaveable { mutableStateOf(0) }   // each step auto-opens once
 
-        LaunchedEffect(Unit) { while (true) { installed = tsInstalled(); ip = tailscaleIp(); batt = batteryOk(); log = loadLog(this@MainActivity); pcs = Pcs.list(this@MainActivity); delay(1500) } }
+        LaunchedEffect(Unit) { while (true) { installed = tsInstalled(); ip = tailscaleIp(); batt = batteryOk(); log = loadLog(this@MainActivity); clients = loadClients(this@MainActivity); delay(1500) } }
         LaunchedEffect(installed, ip, batt) {
             when {
                 !installed && tried and 1 == 0 -> { tried = tried or 1; installTs() }
@@ -137,22 +101,13 @@ class MainActivity : ComponentActivity() {
             }
         }
         val ready = installed && ip != null && batt
-        pcs.firstOrNull { it.secret == pinFor }?.let { PinDialog(it) { pinFor = null; pcs = Pcs.list(this@MainActivity) } }
-        pcs.firstOrNull { it.secret == removeFor }?.let { p ->
-            AlertDialog(onDismissRequest = { removeFor = null },
-                title = { Text("Remove ${p.name}?") },
-                text = { Text("It is taken off the approved list and can no longer wake PCs through this phone. To use it again, generate a new token and link it.") },
-                confirmButton = { TextButton({ Pcs.remove(this@MainActivity, p.secret); pcs = Pcs.list(this@MainActivity); removeFor = null }) { Text("Remove", color = Color(0xFFEF4444)) } },
-                dismissButton = { TextButton({ removeFor = null }) { Text("Cancel") } })
-        }
         val generate: () -> Unit = {
             msg = "Generating…"; pcToken = ""
             Thread { try {
                 val myIp = tailscaleIp() ?: throw Exception("Tailscale is not connected on this phone")
                 val key = createAuthKey(apiKey.trim())
-                val sec = java.util.UUID.randomUUID().toString().replace("-", "").take(24)
-                val old = prefs(this@MainActivity).getStringSet("secrets", emptySet()) ?: emptySet()
-                prefs(this@MainActivity).edit().putStringSet("secrets", HashSet(old) + sec).apply(); pcs = Pcs.list(this@MainActivity)
+                val sec = newSecret()   // one token = one PC; it gets bound to the first PC that uses it
+                editClients(this@MainActivity) { it += Client(sec, "", "", 0, 0, 0) }
                 pcToken = "$key~$sec~$myIp"; msg = "Done. Paste this token into the PC app."
             } catch (e: Exception) {
                 if (e.message?.contains("HTTP 401") == true || e.message?.contains("HTTP 403") == true) {
@@ -162,9 +117,60 @@ class MainActivity : ComponentActivity() {
         }
         LaunchedEffect(clipKey) { clipKey?.let { apiKey = it; prefs(this@MainActivity).edit().putString("api", it).apply(); clipKey = null; generate() } }
 
+        fun fmt(t: Long) = if (t <= 0) "—" else java.text.SimpleDateFormat("dd MMM yyyy HH:mm", java.util.Locale.getDefault()).format(java.util.Date(t))
+        confirmRemove?.let { c -> AlertDialog(onDismissRequest = { confirmRemove = null },
+            title = { Text("Remove ${c.name.ifEmpty { "this token" }}?") },
+            text = { Text("This PC will no longer be able to wake devices through this phone. Its token stops working immediately.") },
+            confirmButton = { TextButton({ editClients(this@MainActivity) { l -> l.removeAll { it.secret == c.secret } }; clients = loadClients(this@MainActivity); confirmRemove = null }) { Text("Remove", color = Color(0xFFEF4444)) } },
+            dismissButton = { TextButton({ confirmRemove = null }) { Text("Cancel") } }) }
+
         Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF0B1020), Color(0xFF1A1440))))
             .statusBarsPadding().verticalScroll(rememberScrollState()).padding(20.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            if (page == "logs") {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton({ page = "home" }) { Text("← Back") }
+                    Text("Wake log", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color.White, modifier = Modifier.weight(1f))
+                    TextButton({ prefs(this@MainActivity).edit().remove("log").apply(); log = emptyList() }) { Text("Clear") }
+                }
+                Card {
+                    if (log.isEmpty()) Text("No wake requests yet.", color = Color.Gray)
+                    log.forEach { Text(it, color = Color.White, fontSize = 12.sp, modifier = Modifier.padding(vertical = 2.dp)) }
+                }
+                return@Column
+            }
             Text("⏻ WoL Relay", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            TabRow(selectedTabIndex = if (page == "approved") 1 else 0, containerColor = Color.Transparent) {
+                Tab(page == "home", { page = "home" }, text = { Text("Home") })
+                Tab(page == "approved", { page = "approved" }, text = { Text("Approved PCs (${clients.count { it.ip.isNotEmpty() }})") })
+            }
+            if (page == "approved") {
+                if (clients.isEmpty()) Card { Text("No PCs yet. Generate a PC token on the Home tab and paste it into the PC app.", color = Color.Gray) }
+                clients.sortedByDescending { it.last }.forEach { c ->
+                    val bound = c.ip.isNotEmpty(); val open = openId == c.secret
+                    Card {
+                        Row(Modifier.fillMaxWidth().clickable { openId = if (open) "" else c.secret }, verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(if (bound) c.name.ifEmpty { c.ip } else "Unused token", color = Color.White, fontWeight = FontWeight.SemiBold)
+                                Text(if (bound) "Approved · ${c.ip}" else "Waiting for a PC to connect", color = if (bound) Color(0xFF22C55E) else Color(0xFFF59E0B), fontSize = 13.sp)
+                            }
+                            Text(if (open) "▲" else "▼", color = Color.Gray)
+                        }
+                        if (open) {
+                            Column(Modifier.padding(top = 12.dp)) {
+                                if (bound) {
+                                    Text("Name: ${c.name.ifEmpty { "—" }}", color = Color.White, fontSize = 13.sp)
+                                    Text("Tailscale IP: ${c.ip}", color = Color.White, fontSize = 13.sp)
+                                    Text("First connected: ${fmt(c.first)}", color = Color.White, fontSize = 13.sp)
+                                    Text("Last seen: ${fmt(c.last)}", color = Color.White, fontSize = 13.sp)
+                                    Text("Wake requests: ${c.wakes}", color = Color.White, fontSize = 13.sp)
+                                } else Text("This token has not been used yet. The first PC that uses it will be locked to it.", color = Color.Gray, fontSize = 13.sp)
+                                OutlinedButton({ confirmRemove = c }, Modifier.fillMaxWidth().padding(top = 10.dp)) { Text(if (bound) "Remove PC" else "Delete token", color = Color(0xFFEF4444)) }
+                            }
+                        }
+                    }
+                }
+                return@Column
+            }
             if (!ready) Card {
                 Text("Setup", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
                 Text("Finish these steps once. Each opens automatically and this screen updates when it's done.",
@@ -175,7 +181,7 @@ class MainActivity : ComponentActivity() {
             } else Card { Text("✔ Setup complete", color = Color(0xFF22C55E), fontWeight = FontWeight.SemiBold) }
             Card {
                 Text("PC token", color = Color.White, fontWeight = FontWeight.SemiBold)
-                Text("Generates the token your PC needs to connect. First time only: the app opens Tailscale so you can sign in and copy an access token; it picks it up automatically.",
+                Text("Each token works for ONE PC only. Generate a separate token for every PC you want to connect. First time only: the app opens Tailscale so you can sign in and copy an access token; it picks it up automatically.",
                     color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(vertical = 6.dp))
                 Button({ if (apiKey.isBlank()) {
                         msg = "Sign in, tap \"Generate access token\", then Copy. Come back here and I'll finish automatically."
@@ -183,20 +189,13 @@ class MainActivity : ComponentActivity() {
                     } else generate() },
                     Modifier.fillMaxWidth()) { Text(if (apiKey.isBlank()) "Get access from Tailscale & generate token" else "Generate PC token") }
                 if (msg.isNotEmpty()) Text(msg, color = Color(0xFF9DB2FF), modifier = Modifier.padding(top = 8.dp))
-                OutlinedButton({ Pcs.removeAll(this@MainActivity); pcs = emptyList(); pcToken = ""; msg = "All PCs removed." },
-                    Modifier.fillMaxWidth()) { Text("Remove all PCs") }
+                OutlinedButton({ editClients(this@MainActivity) { it.clear() }; clients = emptyList(); pcToken = ""; msg = "All PCs unpaired." },
+                    Modifier.fillMaxWidth()) { Text("Unpair all PCs") }
                 if (pcToken.isNotEmpty()) {
                     Text(pcToken, color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(vertical = 8.dp))
                     OutlinedButton({ (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("t", pcToken)) },
                         Modifier.fillMaxWidth()) { Text("Copy token") }
                 }
-            }
-            Card {
-                Text("Approved PCs", color = Color.White, fontWeight = FontWeight.SemiBold)
-                Text("PCs linked with a token. A PC shows the name set in WoL Remote after it connects for the first time. Removing a PC makes its token stop working at once.",
-                    color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(vertical = 6.dp))
-                if (pcs.isEmpty()) Text("No PCs yet. Generate a token above and paste it into WoL Remote.", color = Color.Gray)
-                pcs.forEach { PcRow(it, { pinFor = it.secret }, { removeFor = it.secret }) }
             }
             Card {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -214,14 +213,7 @@ class MainActivity : ComponentActivity() {
                 Text(if (ip != null) "● Connected  $ip" else "● Not connected", color = if (ip != null) Color(0xFF22C55E) else Color(0xFFF59E0B))
                 Text("Link your PC with a token: generate one in the PC token card above and paste it into the PC app.", color = Color(0xFF9DB2FF), modifier = Modifier.padding(top = 8.dp))
             }
-            Card {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Wake log", color = Color.White, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    TextButton({ prefs(this@MainActivity).edit().remove("log").apply(); log = emptyList() }) { Text("Clear") }
-                }
-                if (log.isEmpty()) Text("No wake requests yet.", color = Color.Gray)
-                log.take(40).forEach { Text(it, color = Color.White, fontSize = 12.sp, modifier = Modifier.padding(vertical = 2.dp)) }
-            }
+            OutlinedButton({ page = "logs" }, Modifier.fillMaxWidth()) { Text("Wake log (${log.size})") }
         }
     }
 }
