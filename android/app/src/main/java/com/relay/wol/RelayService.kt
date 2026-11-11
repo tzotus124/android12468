@@ -34,7 +34,7 @@ fun loadLog(c: Context): List<String> = runCatching {
 }.getOrDefault(emptyList())
 
 /** A PC that is (or will be) allowed to wake through this phone. One token = one device: the first PC that uses it is bound to it. */
-data class Client(val secret: String, val name: String, val ip: String, val first: Long, val last: Long, val wakes: Int)
+data class Client(val secret: String, val name: String, val ip: String, val first: Long, val last: Long, val wakes: Int, val role: String = "pc")
 
 private val CLIENT_LOCK = Any()
 fun newSecret(): String = java.util.UUID.randomUUID().toString().replace("-", "").take(24)
@@ -42,7 +42,7 @@ fun loadClients(c: Context): List<Client> = runCatching {
     val p = prefs(c)
     val a = org.json.JSONArray(p.getString("clients", "[]"))
     val list = (0 until a.length()).map { val o = a.getJSONObject(it)
-        Client(o.getString("secret"), o.optString("name"), o.optString("ip"), o.optLong("first"), o.optLong("last"), o.optInt("wakes")) }.toMutableList()
+        Client(o.getString("secret"), o.optString("name"), o.optString("ip"), o.optLong("first"), o.optLong("last"), o.optInt("wakes"), o.optString("role", "pc").ifEmpty { "pc" }) }.toMutableList()
     // migrate tokens made by older versions (unbound)
     val old = p.getStringSet("secrets", null)
     if (old != null) { old.filter { s -> list.none { it.secret == s } }.forEach { list += Client(it, "", "", 0, 0, 0) }
@@ -50,11 +50,126 @@ fun loadClients(c: Context): List<Client> = runCatching {
     list.toList()
 }.getOrDefault(emptyList())
 private fun clientsJson(l: List<Client>): String { val a = org.json.JSONArray()
-    l.forEach { a.put(org.json.JSONObject().put("secret", it.secret).put("name", it.name).put("ip", it.ip).put("first", it.first).put("last", it.last).put("wakes", it.wakes)) }
+    l.forEach { a.put(org.json.JSONObject().put("secret", it.secret).put("name", it.name).put("ip", it.ip).put("first", it.first).put("last", it.last).put("wakes", it.wakes).put("role", it.role)) }
     return a.toString() }
 /** Atomic read-modify-write of the client list. */
 fun editClients(c: Context, f: (MutableList<Client>) -> Unit) = synchronized(CLIENT_LOCK) {
     val l = loadClients(c).toMutableList(); f(l); prefs(c).edit().putString("clients", clientsJson(l)).apply() }
+
+// ---------------- Access PINs: one per Windows account (set in WoL Host > Remote PIN, pushed here by that PC) ----------------
+// Wake and discover requests must carry the PIN of ANY of these accounts while at least one is active. Only salted PBKDF2 hashes are kept; each entry
+// disappears by itself when its time is up.
+private const val PIN_ITER = 200000
+fun pbkdf(pin: String, salt: ByteArray): String =
+    javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(javax.crypto.spec.PBEKeySpec(pin.toCharArray(), salt, PIN_ITER, 256))
+        .encoded.joinToString("") { "%02x".format(it) }
+fun hexBytes(h: String): ByteArray = ByteArray(h.length / 2) { h.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+data class PinEntry(val user: String, val salt: String, val hash: String, val exp: Long)      // exp = epoch seconds, 0 = permanent; user = "" for a PIN from an older version
+private val PIN_LOCK = Any()
+private fun pinsJson(l: List<PinEntry>): String { val a = org.json.JSONArray()
+    l.forEach { a.put(org.json.JSONObject().put("user", it.user).put("salt", it.salt).put("hash", it.hash).put("exp", it.exp)) }
+    return a.toString() }
+/** Stores the whole list (and drops the single PIN an older version kept). */
+fun savePins(c: Context, l: List<PinEntry>) = prefs(c).edit().putString("pins", pinsJson(l)).remove("pin_salt").remove("pin_hash").remove("pin_exp").apply()
+fun clearPins(c: Context) = savePins(c, emptyList())
+fun loadPins(c: Context): List<PinEntry> = synchronized(PIN_LOCK) {
+    val p = prefs(c)
+    val all = runCatching {
+        val a = org.json.JSONArray(p.getString("pins", "[]"))
+        (0 until a.length()).map { val o = a.getJSONObject(it); PinEntry(o.optString("user"), o.getString("salt"), o.getString("hash"), o.optLong("exp")) }
+    }.getOrDefault(emptyList()).toMutableList()
+    val h = p.getString("pin_hash", "") ?: ""; val sl = p.getString("pin_salt", "") ?: ""        // the one PIN an older version kept
+    if (all.isEmpty() && h.isNotEmpty() && sl.isNotEmpty()) all += PinEntry("", sl, h, p.getLong("pin_exp", 0L))
+    val now = System.currentTimeMillis() / 1000
+    val live = all.filter { it.exp == 0L || now < it.exp }
+    if (live.size != all.size) { savePins(c, live); addLog(c, "⏱ ${all.size - live.size} access PIN(s) expired and were removed") }
+    live
+}
+/** data = "all:<user hex>:<salt hex>:<hash hex>:<expiry epoch s, 0 = never>;<next account>..." , "clear", or (older WoL Host) "set:<salt>:<hash>:<expiry>" (sent by WoL Host) -> reply line */
+fun applyPin(c: Context, d: String): String {
+    if (d == "clear") { if (loadPins(c).isNotEmpty()) addLog(c, "🔓 Access PINs removed by WoL Host"); clearPins(c); return "OK" }
+    val list = mutableListOf<PinEntry>()
+    if (d.startsWith("all:")) {
+        for (e in d.removePrefix("all:").split(";").filter { it.isNotEmpty() }) {
+            val f = e.split(":")
+            if (f.size != 4 || !Regex("([0-9a-f]{2})*").matches(f[0]) || !Regex("[0-9a-f]{32}").matches(f[1]) || !Regex("[0-9a-f]{64}").matches(f[2])) return "ERROR bad PIN data"
+            val exp = f[3].toLongOrNull() ?: return "ERROR bad PIN data"
+            list += PinEntry(String(hexBytes(f[0]), Charsets.UTF_8), f[1], f[2], exp)
+        }
+        if (list.isEmpty()) return "ERROR bad PIN data"
+    } else {
+        val p = d.split(":")
+        if (p.size != 4 || p[0] != "set" || !Regex("[0-9a-f]{32}").matches(p[1]) || !Regex("[0-9a-f]{64}").matches(p[2])) return "ERROR bad PIN data"
+        list += PinEntry("", p[1], p[2], p[3].toLongOrNull() ?: return "ERROR bad PIN data")
+    }
+    val before = loadPins(c).map { it.hash to it.exp }.toSet()
+    savePins(c, list)
+    if (before != list.map { it.hash to it.exp }.toSet()) addLog(c, "🔒 ${list.size} access PIN(s) synced from WoL Host" + (if (list.any { it.user.isNotEmpty() }) ": " + list.joinToString(", ") { it.user.ifEmpty { "?" } } else ""))
+    return "OK"
+}
+private val PIN_FAILS = mutableListOf<Long>()
+fun pinLocked(): Boolean = synchronized(PIN_FAILS) { val now = System.currentTimeMillis(); PIN_FAILS.removeAll { now - it > 300000 }; PIN_FAILS.size >= 5 }
+fun pinFailed() { synchronized(PIN_FAILS) { PIN_FAILS.add(System.currentTimeMillis()) } }
+
+// ---------------- Devices on the phone's own network (physical MAC addresses only) ----------------
+data class Dev(val ip: String, val mac: String)
+fun ipToInt(s: String): Int = s.split(".").fold(0) { a, b -> (a shl 8) or b.toInt() }
+fun intToIp(v: Int): String = "${(v ushr 24) and 255}.${(v ushr 16) and 255}.${(v ushr 8) and 255}.${v and 255}"
+/** A real network card: not broadcast / multicast, and not "locally administered" (virtual adapters, phones' private Wi-Fi addresses). */
+fun isPhysicalMac(m: String): Boolean {
+    val b = m.split(":").mapNotNull { it.toIntOrNull(16) }
+    if (b.size != 6 || b.all { it == 0 } || b.all { it == 255 }) return false
+    if ((b[0] and 1) != 0) return false
+    if ((b[0] and 2) != 0) return false
+    return true
+}
+/** Every address of the subnet(s) the phone is on (Tailscale and link-local excluded; at most a /24 each). */
+fun lanTargets(): List<String> {
+    val out = mutableListOf<String>()
+    NetworkInterface.getNetworkInterfaces().toList().filter { it.isUp && !it.isLoopback }.forEach { n ->
+        n.interfaceAddresses.forEach { a ->
+            val ad = a.address
+            if (ad is Inet4Address) {
+                val s = ad.hostAddress ?: return@forEach
+                val p = s.split(".")
+                if (p[0] == "100" && p[1].toInt() in 64..127) return@forEach
+                if (s.startsWith("169.254.")) return@forEach
+                val own = ipToInt(s)
+                val prefix = maxOf(a.networkPrefixLength.toInt(), 24)
+                val net = own and (-1 shl (32 - prefix))
+                for (i in 1 until (1 shl (32 - prefix)) - 1) { val t = net + i; if (t != own) out.add(intToIp(t)) }
+            }
+        }
+    }
+    return out.distinct()
+}
+/** Pokes every address once so the phone learns their MAC addresses, then reads the neighbour table. */
+fun discoverLan(): List<Dev> {
+    val targets = lanTargets()
+    if (targets.isEmpty()) return emptyList()
+    runCatching { DatagramSocket().use { d -> val b = ByteArray(1)
+        for (t in targets) runCatching { d.send(DatagramPacket(b, 1, InetAddress.getByName(t), 9)) } } }
+    Thread.sleep(2000)
+    val seen = linkedMapOf<String, Dev>()
+    runCatching {
+        File("/proc/net/arp").readLines().drop(1).map { it.trim().split(Regex("\\s+")) }.forEach { c ->
+            if (c.size >= 4 && c[2] != "0x0") { val mac = c[3].lowercase(); if (isPhysicalMac(mac)) seen[mac] = Dev(c[0], mac) }
+        }
+    }
+    if (seen.isEmpty()) runCatching {            // newer Android versions hide /proc/net/arp from apps: ask the neighbour table instead
+        val pr = Runtime.getRuntime().exec(arrayOf("ip", "neigh"))
+        pr.inputStream.bufferedReader().readLines().forEach { l ->
+            val m = Regex("^(\\d+\\.\\d+\\.\\d+\\.\\d+).*lladdr\\s+([0-9a-fA-F:]{17})").find(l)
+            if (m != null) { val mac = m.groupValues[2].lowercase(); if (isPhysicalMac(mac)) seen[mac] = Dev(m.groupValues[1], mac) }
+        }
+    }
+    return seen.values.toList()
+}
+fun devsJson(l: List<Dev>): String { val a = org.json.JSONArray(); l.forEach { a.put(org.json.JSONObject().put("ip", it.ip).put("mac", it.mac)) }; return a.toString() }
+fun saveLan(c: Context, l: List<Dev>) = prefs(c).edit().putString("lan", devsJson(l)).putLong("lan_t", System.currentTimeMillis()).apply()
+fun loadLan(c: Context): List<Dev> = runCatching {
+    val a = org.json.JSONArray(prefs(c).getString("lan", "[]")); (0 until a.length()).map { val o = a.getJSONObject(it); Dev(o.optString("ip"), o.optString("mac")) }
+}.getOrDefault(emptyList())
 
 class RelayService : Service() {
     @Volatile private var running = false
@@ -92,12 +207,13 @@ class RelayService : Service() {
             val j = org.json.JSONObject(s.getInputStream().bufferedReader().readLine())
             val mac = j.optString("mac"); val ip = j.optString("ip")
             // Token check: request must be signed with a secret from a PC token generated on this phone
-            val act = j.optString("action"); val t = j.optString("ts"); val msg = "$t|$mac|$ip|$act"
+            val act = j.optString("action"); val t = j.optString("ts"); val data = j.optString("data"); val roleReq = j.optString("role")
+            val msg = if (data.isEmpty()) "$t|$mac|$ip|$act" else "$t|$mac|$ip|$act|$data"      // the access PIN / PIN data is signed too
             val fresh = Math.abs(System.currentTimeMillis() / 1000 - (t.toLongOrNull() ?: 0L)) <= 60
             val sig = j.optString("sig")
             val devName = j.optString("name").trim().take(40)
             // Each token belongs to ONE device: the first PC that uses it is bound to its Tailscale IP; any other device using it is refused.
-            var verdict = "INVALID"
+            var verdict = "INVALID"; var clRole = "pc"
             synchronized(CLIENT_LOCK) {
                 val list = loadClients(this@RelayService).toMutableList()
                 val i = if (fresh) list.indexOfFirst { java.security.MessageDigest.isEqual(hmac(it.secret, msg).toByteArray(), sig.toByteArray()) } else -1
@@ -105,7 +221,9 @@ class RelayService : Service() {
                     val cl = list[i]; val now = System.currentTimeMillis()
                     if (cl.ip.isNotEmpty() && cl.ip != src) verdict = "BOUND"
                     else { verdict = "OK"
-                        list[i] = cl.copy(ip = src, name = devName.ifEmpty { cl.name.ifEmpty { src } }, first = if (cl.first == 0L) now else cl.first, last = now)
+                        list[i] = cl.copy(ip = src, name = devName.ifEmpty { cl.name.ifEmpty { src } }, first = if (cl.first == 0L) now else cl.first, last = now,
+                            role = if (cl.ip.isEmpty()) (if (roleReq == "host") "host" else "pc") else cl.role)      // the role is fixed by the first use of a token
+                        clRole = list[i].role
                         prefs(this@RelayService).edit().putString("clients", clientsJson(list)).apply()
                         if (cl.ip.isEmpty()) addLog(this@RelayService, "＋ Approved new PC ${list[i].name} ($src)") }
                 }
@@ -113,10 +231,28 @@ class RelayService : Service() {
             if (verdict == "BOUND") { addLog(this@RelayService, "✖ Rejected $src: token already belongs to another PC"); return reply("DENIED (token already used by another PC)") }
             if (verdict != "OK") { addLog(this@RelayService, "✖ Rejected request from $src (invalid token)"); return reply("DENIED (invalid token)") }
             if (act == "ping") return reply("PONG|${Build.MODEL}")
+            if (act == "setpin") {                                   // only the token that WoL Host itself used may set or remove the access PIN
+                if (clRole != "host") { addLog(this@RelayService, "✖ $src tried to change the access PIN (not WoL Host)"); return reply("DENIED (only WoL Host may set the access PIN)") }
+                return reply(applyPin(this@RelayService, data))
+            }
+            val pins = loadPins(this@RelayService)
+            var pinUser = ""                                         // whose PIN opened this request (for the log)
+            if (pins.isNotEmpty()) {                                 // wake and discover need the PIN of one of the accounts while any is active
+                if (pinLocked()) { addLog(this@RelayService, "✖ $src locked out: too many wrong PINs"); return reply("DENIED (too many wrong PINs, try again in a few minutes)") }
+                if (data.isEmpty()) return reply("NEED_PIN")
+                val who = pins.firstOrNull { java.security.MessageDigest.isEqual(pbkdf(data, hexBytes(it.salt)).toByteArray(), it.hash.toByteArray()) }
+                if (who == null) { pinFailed(); addLog(this@RelayService, "✖ $src sent a wrong access PIN"); return reply("BAD_PIN") }
+                pinUser = who.user
+            }
+            val viaPin = if (pinUser.isNotEmpty()) " [PIN of $pinUser]" else ""
+            if (act == "discover") {
+                val devs = discoverLan(); saveLan(this@RelayService, devs)
+                addLog(this@RelayService, "🔎 Found ${devs.size} physical device(s) for $src$viaPin"); return reply("MACS|" + devsJson(devs))
+            }
             val m = mac.ifEmpty { arpLookup(ip) } ?: run { addLog(this@RelayService, "✖ Wake ${ip.ifEmpty { "?" }} from $src failed: MAC unknown"); return reply("NEED_MAC (IP not in ARP cache, use MAC)") }
             sendMagic(m, ip.ifEmpty { null })
             editClients(this@RelayService) { l -> val k = l.indexOfFirst { it.ip == src }; if (k >= 0) l[k] = l[k].copy(wakes = l[k].wakes + 1) }
-            addLog(this@RelayService, "✔ Wake $m${if (ip.isNotEmpty()) " ($ip)" else ""} from $src"); reply("OK")
+            addLog(this@RelayService, "✔ Wake $m${if (ip.isNotEmpty()) " ($ip)" else ""} from $src$viaPin"); reply("OK")
         } catch (e: Exception) { runCatching { reply("ERROR ${e.message}") } }
     }
 

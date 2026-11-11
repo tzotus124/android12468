@@ -86,13 +86,16 @@ class MainActivity : ComponentActivity() {
         var msg by remember { mutableStateOf("") }
         var log by remember { mutableStateOf(loadLog(this)) }
         var clients by remember { mutableStateOf(loadClients(this)) }
-        var page by rememberSaveable { mutableStateOf("home") }     // home | approved | logs
+        var pinState by remember { mutableStateOf(loadPins(this)) }
+        var lan by remember { mutableStateOf(loadLan(this)) }
+        var scanning by remember { mutableStateOf(false) }
+        var page by rememberSaveable { mutableStateOf("home") }     // home | approved | devices | logs
         var confirmRemove by remember { mutableStateOf<Client?>(null) }
         var openId by rememberSaveable { mutableStateOf("") }       // secret of the expanded client row
         BackHandler(page != "home") { page = "home" }
         var tried by rememberSaveable { mutableStateOf(0) }   // each step auto-opens once
 
-        LaunchedEffect(Unit) { while (true) { installed = tsInstalled(); ip = tailscaleIp(); batt = batteryOk(); log = loadLog(this@MainActivity); clients = loadClients(this@MainActivity); delay(1500) } }
+        LaunchedEffect(Unit) { while (true) { installed = tsInstalled(); ip = tailscaleIp(); batt = batteryOk(); log = loadLog(this@MainActivity); clients = loadClients(this@MainActivity); pinState = loadPins(this@MainActivity); lan = loadLan(this@MainActivity); delay(1500) } }
         LaunchedEffect(installed, ip, batt) {
             when {
                 !installed && tried and 1 == 0 -> { tried = tried or 1; installTs() }
@@ -139,9 +142,26 @@ class MainActivity : ComponentActivity() {
                 return@Column
             }
             Text("⏻ WoL Relay", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            TabRow(selectedTabIndex = if (page == "approved") 1 else 0, containerColor = Color.Transparent) {
+            TabRow(selectedTabIndex = if (page == "approved") 1 else if (page == "devices") 2 else 0, containerColor = Color.Transparent) {
                 Tab(page == "home", { page = "home" }, text = { Text("Home") })
-                Tab(page == "approved", { page = "approved" }, text = { Text("Approved PCs (${clients.count { it.ip.isNotEmpty() }})") })
+                Tab(page == "approved", { page = "approved" }, text = { Text("PCs (${clients.count { it.ip.isNotEmpty() }})") })
+                Tab(page == "devices", { page = "devices" }, text = { Text("Devices (${lan.size})") })
+            }
+            if (page == "devices") {
+                Card {
+                    Text("Devices on this network", color = Color.White, fontWeight = FontWeight.SemiBold)
+                    Text("Physical MAC addresses this phone finds on its Wi-Fi / LAN. WoL Remote gets this list from here, and only with the access PIN set in WoL Host.",
+                        color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(vertical = 6.dp))
+                    Button({ if (!scanning) { scanning = true
+                            Thread { runCatching { saveLan(this@MainActivity, discoverLan()) }; scanning = false }.start() } },
+                        Modifier.fillMaxWidth(), enabled = !scanning) { Text(if (scanning) "Scanning…" else "Scan now") }
+                }
+                if (lan.isEmpty()) Card { Text("Nothing found yet. Tap Scan now (the phone must be on Wi-Fi).", color = Color.Gray) }
+                lan.forEach { d -> Card {
+                    Text(d.mac, color = Color.White, fontWeight = FontWeight.SemiBold)
+                    Text(d.ip, color = Color.Gray, fontSize = 13.sp)
+                } }
+                return@Column
             }
             if (page == "approved") {
                 if (clients.isEmpty()) Card { Text("No PCs yet. Generate a PC token on the Home tab and paste it into the PC app.", color = Color.Gray) }
@@ -151,7 +171,7 @@ class MainActivity : ComponentActivity() {
                         Row(Modifier.fillMaxWidth().clickable { openId = if (open) "" else c.secret }, verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(if (bound) c.name.ifEmpty { c.ip } else "Unused token", color = Color.White, fontWeight = FontWeight.SemiBold)
-                                Text(if (bound) "Approved · ${c.ip}" else "Waiting for a PC to connect", color = if (bound) Color(0xFF22C55E) else Color(0xFFF59E0B), fontSize = 13.sp)
+                                Text(if (bound) "Approved · ${c.ip}${if (c.role == "host") " · WoL Host (PIN sync)" else ""}" else "Waiting for a PC to connect", color = if (bound) Color(0xFF22C55E) else Color(0xFFF59E0B), fontSize = 13.sp)
                             }
                             Text(if (open) "▲" else "▼", color = Color.Gray)
                         }
@@ -179,6 +199,16 @@ class MainActivity : ComponentActivity() {
                 StepRow(ip != null, "Sign in to Tailscale", "Sign in", installed) { openTs() }
                 StepRow(batt, "Keep relay always on", "Allow", true) { askBattery() }
             } else Card { Text("✔ Setup complete", color = Color(0xFF22C55E), fontWeight = FontWeight.SemiBold) }
+            Card {
+                Text("Access PIN", color = Color.White, fontWeight = FontWeight.SemiBold)
+                val ps = pinState
+                if (ps.isEmpty()) Text("None. Waking a PC through this phone and scanning the network need no PIN. Set a PIN for each Windows account in WoL Host > Remote PIN; they are copied here automatically.",
+                    color = Color(0xFFF59E0B), fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
+                else {
+                    Text("✔ Required for wake and scan · the PIN of any account below · set in WoL Host", color = Color(0xFF22C55E), modifier = Modifier.padding(top = 6.dp))
+                    ps.forEach { Text("• ${it.user.ifEmpty { "PIN" }} · " + (if (it.exp > 0) "expires ${fmt(it.exp * 1000)}" else "permanent"), color = Color.Gray, fontSize = 13.sp) }
+                }
+            }
             Card {
                 Text("PC token", color = Color.White, fontWeight = FontWeight.SemiBold)
                 Text("Each token works for ONE PC only. Generate a separate token for every PC you want to connect. First time only: the app opens Tailscale so you can sign in and copy an access token; it picks it up automatically.",
