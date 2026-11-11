@@ -220,6 +220,8 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+                if (shownClients.isNotEmpty()) OutlinedButton({ editClients(this@MainActivity) { l -> l.removeAll { it.role != "host" } }; clients = loadClients(this@MainActivity); pcToken = ""; openId = ""; msg = "All clients unpaired." },
+                    Modifier.fillMaxWidth().padding(top = 12.dp)) { Text("Unpair all clients", color = Color(0xFFEF4444)) }
                 return@Column
             }
             if (!ready) Card {
@@ -250,8 +252,6 @@ class MainActivity : ComponentActivity() {
                     } else generate() },
                     Modifier.fillMaxWidth()) { Text(if (apiKey.isBlank()) "Get access from Tailscale & generate token" else "Generate PC token") }
                 if (msg.isNotEmpty()) Text(msg, color = Color(0xFF9DB2FF), modifier = Modifier.padding(top = 8.dp))
-                OutlinedButton({ editClients(this@MainActivity) { l -> l.removeAll { it.role != "host" } }; clients = loadClients(this@MainActivity); pcToken = ""; msg = "All clients unpaired." },
-                    Modifier.fillMaxWidth()) { Text("Unpair all clients") }
                 if (pcToken.isNotEmpty()) {
                     Text(pcToken, color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(vertical = 8.dp))
                     OutlinedButton({ (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("t", pcToken)) },
