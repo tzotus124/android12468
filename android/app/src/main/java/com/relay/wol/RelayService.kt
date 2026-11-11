@@ -272,6 +272,10 @@ class RelayService : Service() {
                 addLog(this@RelayService, "＋ Host $nm ($src) saved with MAC ${macs.joinToString(", ")}")
                 return reply("OK")
             }
+            if (act == "hosts") {                                    // the saved hosts (Tailscale IP + MAC) go to every linked client without a PIN, so adding a token never asks for one; waking and scanning still need it
+                val txt = hostsForClients(this@RelayService)
+                return reply("HOSTS|$txt")                           // not logged: clients ask for this every 30 s
+            }
             val pins = loadPins(this@RelayService)
             var pinUser = ""                                         // whose PIN opened this request (for the log)
             if (pins.isNotEmpty()) {                                 // wake and discover need the PIN of one of the accounts while any is active
@@ -282,10 +286,6 @@ class RelayService : Service() {
                 pinUser = who.user
             }
             val viaPin = if (pinUser.isNotEmpty()) " [PIN of $pinUser]" else ""
-            if (act == "hosts") {                                    // a client (WoL Remote) asks right after it joined: the saved hosts with their Tailscale IP and MACs
-                val txt = hostsForClients(this@RelayService)
-                addLog(this@RelayService, "📤 Sent ${loadHosts(this@RelayService).size} host(s) to $src$viaPin"); return reply("HOSTS|$txt")
-            }
             if (act == "discover") {
                 val devs = discoverLan(); saveLan(this@RelayService, devs)
                 addLog(this@RelayService, "🔎 Found ${devs.size} physical device(s) for $src$viaPin"); return reply("MACS|" + devsJson(devs))

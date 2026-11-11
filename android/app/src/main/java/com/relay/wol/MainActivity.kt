@@ -137,6 +137,7 @@ class MainActivity : ComponentActivity() {
             dismissButton = { TextButton({ confirmHost = null }) { Text("Cancel") } }) }
 
         // a host whose token was used is detected at once (its first request marks the token as WoL Host's); its MAC address is added as soon as it arrives
+        val shownClients = clients.filter { it.role != "host" }      // WoL Host's own token is listed under Hosts only, never as a client
         val pendingHosts = clients.filter { it.role == "host" && it.ip.isNotEmpty() && hosts.none { h -> h.ip == it.ip } }
         Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF0B1020), Color(0xFF1A1440))))
             .statusBarsPadding().verticalScroll(rememberScrollState()).padding(20.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -155,7 +156,7 @@ class MainActivity : ComponentActivity() {
             Text("⏻ WoL Relay", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White)
             TabRow(selectedTabIndex = if (page == "approved") 1 else if (page == "devices") 2 else 0, containerColor = Color.Transparent) {
                 Tab(page == "home", { page = "home" }, text = { Text("Home") })
-                Tab(page == "approved", { page = "approved" }, text = { Text("Clients (${clients.count { it.ip.isNotEmpty() }})") })
+                Tab(page == "approved", { page = "approved" }, text = { Text("Clients (${shownClients.count { it.ip.isNotEmpty() }})") })
                 Tab(page == "devices", { page = "devices" }, text = { Text("Hosts (${hosts.size + pendingHosts.size})") })
             }
             if (page == "devices") {
@@ -194,8 +195,8 @@ class MainActivity : ComponentActivity() {
                 return@Column
             }
             if (page == "approved") {
-                if (clients.isEmpty()) Card { Text("No clients yet. Generate a token on the Home tab and paste it into the app.", color = Color.Gray) }
-                clients.sortedByDescending { it.last }.forEach { c ->
+                if (shownClients.isEmpty()) Card { Text("No clients yet. Generate a token on the Home tab and paste it into the app.", color = Color.Gray) }
+                shownClients.sortedByDescending { it.last }.forEach { c ->
                     val bound = c.ip.isNotEmpty(); val open = openId == c.secret
                     Card {
                         Row(Modifier.fillMaxWidth().clickable { openId = if (open) "" else c.secret }, verticalAlignment = Alignment.CenterVertically) {
@@ -249,7 +250,7 @@ class MainActivity : ComponentActivity() {
                     } else generate() },
                     Modifier.fillMaxWidth()) { Text(if (apiKey.isBlank()) "Get access from Tailscale & generate token" else "Generate PC token") }
                 if (msg.isNotEmpty()) Text(msg, color = Color(0xFF9DB2FF), modifier = Modifier.padding(top = 8.dp))
-                OutlinedButton({ editClients(this@MainActivity) { it.clear() }; clients = emptyList(); pcToken = ""; msg = "All clients unpaired." },
+                OutlinedButton({ editClients(this@MainActivity) { l -> l.removeAll { it.role != "host" } }; clients = loadClients(this@MainActivity); pcToken = ""; msg = "All clients unpaired." },
                     Modifier.fillMaxWidth()) { Text("Unpair all clients") }
                 if (pcToken.isNotEmpty()) {
                     Text(pcToken, color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(vertical = 8.dp))
