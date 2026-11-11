@@ -248,18 +248,20 @@ class RelayService : Service() {
                     val wantRole = if (roleReq == "host") "host" else "pc"
                     if (cl.ip.isNotEmpty() && cl.ip != src) verdict = "BOUND"
                     else if (cl.ip.isNotEmpty() && cl.role != wantRole) verdict = if (cl.role == "host") "ISHOST" else "ISCLIENT"      // a token that joined as a client can never be used by a host, and the other way round
-                    else if (cl.ip.isEmpty() && list.any { it.ip == src && it.role == wantRole && it.secret != cl.secret }) verdict = "DUPLICATE"   // this device already joined with another token of the same kind
                     else { verdict = "OK"
-                        list[i] = cl.copy(ip = src, name = devName.ifEmpty { cl.name.ifEmpty { src } }, first = if (cl.first == 0L) now else cl.first, last = now, token = "",
+                        // A device keeps ONE token per kind: when it joins with a new token, its previous token(s) of the same kind are deleted.
+                        val old = if (cl.ip.isEmpty()) list.filter { it.ip == src && it.role == wantRole && it.secret != cl.secret } else emptyList()
+                        if (old.isNotEmpty()) { list.removeAll(old); addLog(this@RelayService, "↻ ${devName.ifEmpty { src }} ($src) joined with a new token - previous token deleted") }
+                        val k = list.indexOfFirst { it.secret == cl.secret }
+                        list[k] = cl.copy(ip = src, name = devName.ifEmpty { cl.name.ifEmpty { src } }, first = if (cl.first == 0L) now else cl.first, last = now, token = "",
                             role = if (cl.ip.isEmpty()) (if (roleReq == "host") "host" else "pc") else cl.role)      // the role is fixed by the first use of a token
-                        clRole = list[i].role
+                        clRole = list[k].role
                         prefs(this@RelayService).edit().putString("clients", clientsJson(list)).apply()
-                        if (cl.ip.isEmpty()) addLog(this@RelayService, "＋ Approved new client ${list[i].name} ($src)") }
+                        if (cl.ip.isEmpty()) addLog(this@RelayService, "＋ Approved new client ${list[k].name} ($src)") }
                 }
             }
             if (verdict == "ISHOST") { addLog(this@RelayService, "✖ Rejected $src: this token belongs to a host, not a client"); return reply("DENIED (this token already belongs to a host)") }
             if (verdict == "ISCLIENT") { addLog(this@RelayService, "✖ Rejected $src: this token belongs to a client, not a host"); return reply("DENIED (this token already belongs to a client)") }
-            if (verdict == "DUPLICATE") { addLog(this@RelayService, "✖ Rejected $src: this device already joined with another token (remove it first)"); return reply("DENIED (this device already joined with another token)") }
             if (verdict == "BOUND") { addLog(this@RelayService, "✖ Rejected $src: token already belongs to another client"); return reply("DENIED (token already used by another client)") }
             if (verdict != "OK") { addLog(this@RelayService, "✖ Rejected request from $src (invalid token)"); return reply("DENIED (invalid token)") }
             if (act == "ping") return reply("PONG|${Build.MODEL}")
