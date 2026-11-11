@@ -56,6 +56,32 @@ private fun clientsJson(l: List<Client>): String { val a = org.json.JSONArray()
 fun editClients(c: Context, f: (MutableList<Client>) -> Unit) = synchronized(CLIENT_LOCK) {
     val l = loadClients(c).toMutableList(); f(l); prefs(c).edit().putString("clients", clientsJson(l)).apply() }
 
+// ---------------- Hosts: PCs that joined with a token send their physical MAC address(es) here (WoL Host > Set up) ----------------
+data class Host(val ip: String, val name: String, val macs: List<String>, val updated: Long)
+private val HOST_LOCK = Any()
+private val MAC_RE = Regex("([0-9a-f]{2}:){5}[0-9a-f]{2}")
+private val IP_RE = Regex("(\\d{1,3}\\.){3}\\d{1,3}")
+/** The Tailscale IP a host reports in its sethost data ("100.x.y.z,aa:bb:..") or "" when it sent none (older WoL Host). */
+fun parseReportedIp(data: String): String = data.split(",", ";", " ").map { it.trim() }.firstOrNull { IP_RE.matches(it) } ?: ""
+/** What clients get: every saved host with its Tailscale IP and MAC addresses, as one line of JSON. */
+fun hostsForClients(c: Context): String { val a = org.json.JSONArray()
+    loadHosts(c).forEach { a.put(org.json.JSONObject().put("ip", it.ip).put("name", it.name).put("macs", org.json.JSONArray(it.macs))) }
+    return a.toString() }
+private fun hostsJson(l: List<Host>): String { val a = org.json.JSONArray()
+    l.forEach { a.put(org.json.JSONObject().put("ip", it.ip).put("name", it.name).put("macs", org.json.JSONArray(it.macs)).put("updated", it.updated)) }
+    return a.toString() }
+fun loadHosts(c: Context): List<Host> = synchronized(HOST_LOCK) { runCatching {
+    val a = org.json.JSONArray(prefs(c).getString("hosts", "[]"))
+    (0 until a.length()).map { val o = a.getJSONObject(it); val m = o.optJSONArray("macs")
+        Host(o.optString("ip"), o.optString("name"), if (m == null) emptyList() else (0 until m.length()).map { i -> m.getString(i) }, o.optLong("updated")) }
+}.getOrDefault(emptyList()) }
+/** Atomic read-modify-write of the host list. */
+fun editHosts(c: Context, f: (MutableList<Host>) -> Unit) = synchronized(HOST_LOCK) {
+    val l = loadHosts(c).toMutableList(); f(l); prefs(c).edit().putString("hosts", hostsJson(l)).apply() }
+/** "aa:bb:..,cc-dd-.." -> clean, lower-case, colon-separated MACs (invalid and all-zero entries dropped). */
+fun parseMacs(data: String): List<String> = data.split(",", ";", " ").map { it.trim().lowercase().replace("-", ":") }
+    .filter { MAC_RE.matches(it) && it != "00:00:00:00:00:00" }.distinct().take(8)
+
 // ---------------- Access PINs: one per Windows account (set in WoL Host > Remote PIN, pushed here by that PC) ----------------
 // Wake and discover requests must carry the PIN of ANY of these accounts while at least one is active. Only salted PBKDF2 hashes are kept; each entry
 // disappears by itself when its time is up.
@@ -225,15 +251,26 @@ class RelayService : Service() {
                             role = if (cl.ip.isEmpty()) (if (roleReq == "host") "host" else "pc") else cl.role)      // the role is fixed by the first use of a token
                         clRole = list[i].role
                         prefs(this@RelayService).edit().putString("clients", clientsJson(list)).apply()
-                        if (cl.ip.isEmpty()) addLog(this@RelayService, "＋ Approved new PC ${list[i].name} ($src)") }
+                        if (cl.ip.isEmpty()) addLog(this@RelayService, "＋ Approved new client ${list[i].name} ($src)") }
                 }
             }
-            if (verdict == "BOUND") { addLog(this@RelayService, "✖ Rejected $src: token already belongs to another PC"); return reply("DENIED (token already used by another PC)") }
+            if (verdict == "BOUND") { addLog(this@RelayService, "✖ Rejected $src: token already belongs to another client"); return reply("DENIED (token already used by another client)") }
             if (verdict != "OK") { addLog(this@RelayService, "✖ Rejected request from $src (invalid token)"); return reply("DENIED (invalid token)") }
             if (act == "ping") return reply("PONG|${Build.MODEL}")
             if (act == "setpin") {                                   // only the token that WoL Host itself used may set or remove the access PIN
                 if (clRole != "host") { addLog(this@RelayService, "✖ $src tried to change the access PIN (not WoL Host)"); return reply("DENIED (only WoL Host may set the access PIN)") }
                 return reply(applyPin(this@RelayService, data))
+            }
+            if (act == "sethost") {                                  // WoL Host reports its physical MAC address(es) right after it joined with its token
+                if (clRole != "host") { addLog(this@RelayService, "✖ $src tried to register a host (not WoL Host)"); return reply("DENIED (only WoL Host may register a host)") }
+                val macs = parseMacs(data)
+                if (macs.isEmpty()) return reply("ERROR no valid MAC address")
+                val nm = devName.ifEmpty { src }; val now = System.currentTimeMillis()
+                val said = parseReportedIp(data)      // the token is bound to the address the request really came from, so that one is saved (a different reported one is only logged)
+                if (said.isNotEmpty() && said != src) addLog(this@RelayService, "⚠ Host $nm reported $said but connected from $src - saved $src")
+                editHosts(this@RelayService) { l -> l.removeAll { it.ip == src || it.macs.any { m -> m in macs } }; l += Host(src, nm, macs, now) }
+                addLog(this@RelayService, "＋ Host $nm ($src) saved with MAC ${macs.joinToString(", ")}")
+                return reply("OK")
             }
             val pins = loadPins(this@RelayService)
             var pinUser = ""                                         // whose PIN opened this request (for the log)
@@ -245,6 +282,10 @@ class RelayService : Service() {
                 pinUser = who.user
             }
             val viaPin = if (pinUser.isNotEmpty()) " [PIN of $pinUser]" else ""
+            if (act == "hosts") {                                    // a client (WoL Remote) asks right after it joined: the saved hosts with their Tailscale IP and MACs
+                val txt = hostsForClients(this@RelayService)
+                addLog(this@RelayService, "📤 Sent ${loadHosts(this@RelayService).size} host(s) to $src$viaPin"); return reply("HOSTS|$txt")
+            }
             if (act == "discover") {
                 val devs = discoverLan(); saveLan(this@RelayService, devs)
                 addLog(this@RelayService, "🔎 Found ${devs.size} physical device(s) for $src$viaPin"); return reply("MACS|" + devsJson(devs))

@@ -88,14 +88,16 @@ class MainActivity : ComponentActivity() {
         var clients by remember { mutableStateOf(loadClients(this)) }
         var pinState by remember { mutableStateOf(loadPins(this)) }
         var lan by remember { mutableStateOf(loadLan(this)) }
+        var hosts by remember { mutableStateOf(loadHosts(this)) }
         var scanning by remember { mutableStateOf(false) }
         var page by rememberSaveable { mutableStateOf("home") }     // home | approved | devices | logs
         var confirmRemove by remember { mutableStateOf<Client?>(null) }
+        var confirmHost by remember { mutableStateOf<Host?>(null) }
         var openId by rememberSaveable { mutableStateOf("") }       // secret of the expanded client row
         BackHandler(page != "home") { page = "home" }
         var tried by rememberSaveable { mutableStateOf(0) }   // each step auto-opens once
 
-        LaunchedEffect(Unit) { while (true) { installed = tsInstalled(); ip = tailscaleIp(); batt = batteryOk(); log = loadLog(this@MainActivity); clients = loadClients(this@MainActivity); pinState = loadPins(this@MainActivity); lan = loadLan(this@MainActivity); delay(1500) } }
+        LaunchedEffect(Unit) { while (true) { installed = tsInstalled(); ip = tailscaleIp(); batt = batteryOk(); log = loadLog(this@MainActivity); clients = loadClients(this@MainActivity); pinState = loadPins(this@MainActivity); lan = loadLan(this@MainActivity); hosts = loadHosts(this@MainActivity); delay(1500) } }
         LaunchedEffect(installed, ip, batt) {
             when {
                 !installed && tried and 1 == 0 -> { tried = tried or 1; installTs() }
@@ -123,9 +125,15 @@ class MainActivity : ComponentActivity() {
         fun fmt(t: Long) = if (t <= 0) "—" else java.text.SimpleDateFormat("dd MMM yyyy HH:mm", java.util.Locale.getDefault()).format(java.util.Date(t))
         confirmRemove?.let { c -> AlertDialog(onDismissRequest = { confirmRemove = null },
             title = { Text("Remove ${c.name.ifEmpty { "this token" }}?") },
-            text = { Text("This PC will no longer be able to wake devices through this phone. Its token stops working immediately.") },
+            text = { Text("This client will no longer be able to wake hosts through this phone. Its token stops working immediately.") },
             confirmButton = { TextButton({ editClients(this@MainActivity) { l -> l.removeAll { it.secret == c.secret } }; clients = loadClients(this@MainActivity); confirmRemove = null }) { Text("Remove", color = Color(0xFFEF4444)) } },
             dismissButton = { TextButton({ confirmRemove = null }) { Text("Cancel") } }) }
+
+        confirmHost?.let { h -> AlertDialog(onDismissRequest = { confirmHost = null },
+            title = { Text("Remove ${h.name.ifEmpty { h.ip }}?") },
+            text = { Text("The saved MAC address of this host is deleted from this phone. It is saved again when WoL Host on that PC joins with a token.") },
+            confirmButton = { TextButton({ editHosts(this@MainActivity) { l -> l.removeAll { it.ip == h.ip } }; hosts = loadHosts(this@MainActivity); confirmHost = null }) { Text("Remove", color = Color(0xFFEF4444)) } },
+            dismissButton = { TextButton({ confirmHost = null }) { Text("Cancel") } }) }
 
         Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF0B1020), Color(0xFF1A1440))))
             .statusBarsPadding().verticalScroll(rememberScrollState()).padding(20.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -144,12 +152,25 @@ class MainActivity : ComponentActivity() {
             Text("⏻ WoL Relay", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White)
             TabRow(selectedTabIndex = if (page == "approved") 1 else if (page == "devices") 2 else 0, containerColor = Color.Transparent) {
                 Tab(page == "home", { page = "home" }, text = { Text("Home") })
-                Tab(page == "approved", { page = "approved" }, text = { Text("PCs (${clients.count { it.ip.isNotEmpty() }})") })
-                Tab(page == "devices", { page = "devices" }, text = { Text("Devices (${lan.size})") })
+                Tab(page == "approved", { page = "approved" }, text = { Text("Clients (${clients.count { it.ip.isNotEmpty() }})") })
+                Tab(page == "devices", { page = "devices" }, text = { Text("Hosts (${hosts.size})") })
             }
             if (page == "devices") {
                 Card {
-                    Text("Devices on this network", color = Color.White, fontWeight = FontWeight.SemiBold)
+                    Text("Hosts", color = Color.White, fontWeight = FontWeight.SemiBold)
+                    Text("A host is a PC set up with WoL Host. When it joins with a token it sends its Tailscale IP and physical MAC address here, so this phone can wake it. Clients get this list automatically when they join. Remove a host to forget it.",
+                        color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
+                }
+                if (hosts.isEmpty()) Card { Text("No hosts yet. Generate a token on the Home tab and paste it into WoL Host > Set up; the host appears here by itself.", color = Color.Gray) }
+                hosts.sortedByDescending { it.updated }.forEach { h -> Card {
+                    Text(h.name.ifEmpty { h.ip }, color = Color.White, fontWeight = FontWeight.SemiBold)
+                    h.macs.forEach { Text("MAC  $it", color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp)) }
+                    Text("Tailscale IP: ${h.ip}", color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
+                    Text("Saved: ${fmt(h.updated)}", color = Color.Gray, fontSize = 13.sp)
+                    OutlinedButton({ confirmHost = h }, Modifier.fillMaxWidth().padding(top = 10.dp)) { Text("Remove host", color = Color(0xFFEF4444)) }
+                } }
+                Card {
+                    Text("Network scan", color = Color.White, fontWeight = FontWeight.SemiBold)
                     Text("Physical MAC addresses this phone finds on its Wi-Fi / LAN. WoL Remote gets this list from here, and only with the access PIN set in WoL Host.",
                         color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(vertical = 6.dp))
                     Button({ if (!scanning) { scanning = true
@@ -164,14 +185,14 @@ class MainActivity : ComponentActivity() {
                 return@Column
             }
             if (page == "approved") {
-                if (clients.isEmpty()) Card { Text("No PCs yet. Generate a PC token on the Home tab and paste it into the PC app.", color = Color.Gray) }
+                if (clients.isEmpty()) Card { Text("No clients yet. Generate a token on the Home tab and paste it into the app.", color = Color.Gray) }
                 clients.sortedByDescending { it.last }.forEach { c ->
                     val bound = c.ip.isNotEmpty(); val open = openId == c.secret
                     Card {
                         Row(Modifier.fillMaxWidth().clickable { openId = if (open) "" else c.secret }, verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(if (bound) c.name.ifEmpty { c.ip } else "Unused token", color = Color.White, fontWeight = FontWeight.SemiBold)
-                                Text(if (bound) "Approved · ${c.ip}${if (c.role == "host") " · WoL Host (PIN sync)" else ""}" else "Waiting for a PC to connect", color = if (bound) Color(0xFF22C55E) else Color(0xFFF59E0B), fontSize = 13.sp)
+                                Text(if (bound) "Approved · ${c.ip}${if (c.role == "host") " · WoL Host (PIN sync)" else ""}" else "Waiting for a client or host to connect", color = if (bound) Color(0xFF22C55E) else Color(0xFFF59E0B), fontSize = 13.sp)
                             }
                             Text(if (open) "▲" else "▼", color = Color.Gray)
                         }
@@ -183,8 +204,8 @@ class MainActivity : ComponentActivity() {
                                     Text("First connected: ${fmt(c.first)}", color = Color.White, fontSize = 13.sp)
                                     Text("Last seen: ${fmt(c.last)}", color = Color.White, fontSize = 13.sp)
                                     Text("Wake requests: ${c.wakes}", color = Color.White, fontSize = 13.sp)
-                                } else Text("This token has not been used yet. The first PC that uses it will be locked to it.", color = Color.Gray, fontSize = 13.sp)
-                                OutlinedButton({ confirmRemove = c }, Modifier.fillMaxWidth().padding(top = 10.dp)) { Text(if (bound) "Remove PC" else "Delete token", color = Color(0xFFEF4444)) }
+                                } else Text("This token has not been used yet. The first client or host that uses it will be locked to it.", color = Color.Gray, fontSize = 13.sp)
+                                OutlinedButton({ confirmRemove = c }, Modifier.fillMaxWidth().padding(top = 10.dp)) { Text(if (bound) "Remove client" else "Delete token", color = Color(0xFFEF4444)) }
                             }
                         }
                     }
@@ -219,8 +240,8 @@ class MainActivity : ComponentActivity() {
                     } else generate() },
                     Modifier.fillMaxWidth()) { Text(if (apiKey.isBlank()) "Get access from Tailscale & generate token" else "Generate PC token") }
                 if (msg.isNotEmpty()) Text(msg, color = Color(0xFF9DB2FF), modifier = Modifier.padding(top = 8.dp))
-                OutlinedButton({ editClients(this@MainActivity) { it.clear() }; clients = emptyList(); pcToken = ""; msg = "All PCs unpaired." },
-                    Modifier.fillMaxWidth()) { Text("Unpair all PCs") }
+                OutlinedButton({ editClients(this@MainActivity) { it.clear() }; clients = emptyList(); pcToken = ""; msg = "All clients unpaired." },
+                    Modifier.fillMaxWidth()) { Text("Unpair all clients") }
                 if (pcToken.isNotEmpty()) {
                     Text(pcToken, color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(vertical = 8.dp))
                     OutlinedButton({ (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("t", pcToken)) },
