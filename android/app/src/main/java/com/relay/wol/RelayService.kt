@@ -34,7 +34,7 @@ fun loadLog(c: Context): List<String> = runCatching {
 }.getOrDefault(emptyList())
 
 /** A PC that is (or will be) allowed to wake through this phone. One token = one device: the first PC that uses it is bound to it. */
-data class Client(val secret: String, val name: String, val ip: String, val first: Long, val last: Long, val wakes: Int, val role: String = "pc")
+data class Client(val secret: String, val name: String, val ip: String, val first: Long, val last: Long, val wakes: Int, val role: String = "pc", val token: String = "", val made: Long = 0)
 
 private val CLIENT_LOCK = Any()
 fun newSecret(): String = java.util.UUID.randomUUID().toString().replace("-", "").take(24)
@@ -42,7 +42,7 @@ fun loadClients(c: Context): List<Client> = runCatching {
     val p = prefs(c)
     val a = org.json.JSONArray(p.getString("clients", "[]"))
     val list = (0 until a.length()).map { val o = a.getJSONObject(it)
-        Client(o.getString("secret"), o.optString("name"), o.optString("ip"), o.optLong("first"), o.optLong("last"), o.optInt("wakes"), o.optString("role", "pc").ifEmpty { "pc" }) }.toMutableList()
+        Client(o.getString("secret"), o.optString("name"), o.optString("ip"), o.optLong("first"), o.optLong("last"), o.optInt("wakes"), o.optString("role", "pc").ifEmpty { "pc" }, o.optString("token"), o.optLong("made")) }.toMutableList()
     // migrate tokens made by older versions (unbound)
     val old = p.getStringSet("secrets", null)
     if (old != null) { old.filter { s -> list.none { it.secret == s } }.forEach { list += Client(it, "", "", 0, 0, 0) }
@@ -50,7 +50,7 @@ fun loadClients(c: Context): List<Client> = runCatching {
     list.toList()
 }.getOrDefault(emptyList())
 private fun clientsJson(l: List<Client>): String { val a = org.json.JSONArray()
-    l.forEach { a.put(org.json.JSONObject().put("secret", it.secret).put("name", it.name).put("ip", it.ip).put("first", it.first).put("last", it.last).put("wakes", it.wakes).put("role", it.role)) }
+    l.forEach { a.put(org.json.JSONObject().put("secret", it.secret).put("name", it.name).put("ip", it.ip).put("first", it.first).put("last", it.last).put("wakes", it.wakes).put("role", it.role).put("token", it.token).put("made", it.made)) }
     return a.toString() }
 /** Atomic read-modify-write of the client list. */
 fun editClients(c: Context, f: (MutableList<Client>) -> Unit) = synchronized(CLIENT_LOCK) {
@@ -245,15 +245,21 @@ class RelayService : Service() {
                 val i = if (fresh) list.indexOfFirst { java.security.MessageDigest.isEqual(hmac(it.secret, msg).toByteArray(), sig.toByteArray()) } else -1
                 if (i >= 0) {
                     val cl = list[i]; val now = System.currentTimeMillis()
+                    val wantRole = if (roleReq == "host") "host" else "pc"
                     if (cl.ip.isNotEmpty() && cl.ip != src) verdict = "BOUND"
+                    else if (cl.ip.isNotEmpty() && cl.role != wantRole) verdict = if (cl.role == "host") "ISHOST" else "ISCLIENT"      // a token that joined as a client can never be used by a host, and the other way round
+                    else if (cl.ip.isEmpty() && list.any { it.ip == src && it.role == wantRole && it.secret != cl.secret }) verdict = "DUPLICATE"   // this device already joined with another token of the same kind
                     else { verdict = "OK"
-                        list[i] = cl.copy(ip = src, name = devName.ifEmpty { cl.name.ifEmpty { src } }, first = if (cl.first == 0L) now else cl.first, last = now,
+                        list[i] = cl.copy(ip = src, name = devName.ifEmpty { cl.name.ifEmpty { src } }, first = if (cl.first == 0L) now else cl.first, last = now, token = "",
                             role = if (cl.ip.isEmpty()) (if (roleReq == "host") "host" else "pc") else cl.role)      // the role is fixed by the first use of a token
                         clRole = list[i].role
                         prefs(this@RelayService).edit().putString("clients", clientsJson(list)).apply()
                         if (cl.ip.isEmpty()) addLog(this@RelayService, "＋ Approved new client ${list[i].name} ($src)") }
                 }
             }
+            if (verdict == "ISHOST") { addLog(this@RelayService, "✖ Rejected $src: this token belongs to a host, not a client"); return reply("DENIED (this token already belongs to a host)") }
+            if (verdict == "ISCLIENT") { addLog(this@RelayService, "✖ Rejected $src: this token belongs to a client, not a host"); return reply("DENIED (this token already belongs to a client)") }
+            if (verdict == "DUPLICATE") { addLog(this@RelayService, "✖ Rejected $src: this device already joined with another token (remove it first)"); return reply("DENIED (this device already joined with another token)") }
             if (verdict == "BOUND") { addLog(this@RelayService, "✖ Rejected $src: token already belongs to another client"); return reply("DENIED (token already used by another client)") }
             if (verdict != "OK") { addLog(this@RelayService, "✖ Rejected request from $src (invalid token)"); return reply("DENIED (invalid token)") }
             if (act == "ping") return reply("PONG|${Build.MODEL}")

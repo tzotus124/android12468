@@ -110,10 +110,12 @@ class MainActivity : ComponentActivity() {
             msg = "Generating…"; pcToken = ""
             Thread { try {
                 val myIp = tailscaleIp() ?: throw Exception("Tailscale is not connected on this phone")
+                val unused = loadClients(this@MainActivity).firstOrNull { it.ip.isEmpty() }       // a token nobody has used yet: never make a second one, reuse it
                 val key = createAuthKey(apiKey.trim())
-                val sec = newSecret()   // one token = one PC; it gets bound to the first PC that uses it
-                editClients(this@MainActivity) { it += Client(sec, "", "", 0, 0, 0) }
-                pcToken = "$key~$sec~$myIp"; msg = "Done. Paste this token into the PC app."
+                val sec = unused?.secret ?: newSecret()   // one token = one device (a client OR a host); it gets bound to the first device that uses it
+                val full = "$key~$sec~$myIp"; val now = System.currentTimeMillis()
+                editClients(this@MainActivity) { l -> val k = l.indexOfFirst { it.secret == sec }; if (k >= 0) l[k] = l[k].copy(token = full, made = now) else l += Client(sec, "", "", 0, 0, 0, "pc", full, now) }
+                pcToken = full; msg = if (unused != null) "Your unused token was renewed (same token, fresh Tailscale key). Use it before making another." else "Done. Paste this token into the PC app."
             } catch (e: Exception) {
                 if (e.message?.contains("HTTP 401") == true || e.message?.contains("HTTP 403") == true) {
                     apiKey = ""; prefs(this@MainActivity).edit().remove("api").apply()
@@ -187,7 +189,6 @@ class MainActivity : ComponentActivity() {
                             Thread { runCatching { saveLan(this@MainActivity, discoverLan()) }; scanning = false }.start() } },
                         Modifier.fillMaxWidth(), enabled = !scanning) { Text(if (scanning) "Scanning…" else "Scan now") }
                 }
-                if (lan.isEmpty()) Card { Text("Nothing found yet. Tap Scan now (the phone must be on Wi-Fi).", color = Color.Gray) }
                 lan.forEach { d -> Card {
                     Text(d.mac, color = Color.White, fontWeight = FontWeight.SemiBold)
                     Text(d.ip, color = Color.Gray, fontSize = 13.sp)
@@ -233,24 +234,16 @@ class MainActivity : ComponentActivity() {
                 StepRow(batt, "Keep relay always on", "Allow", true) { askBattery() }
             } else Card { Text("✔ Setup complete", color = Color(0xFF22C55E), fontWeight = FontWeight.SemiBold) }
             Card {
-                Text("Access PIN", color = Color.White, fontWeight = FontWeight.SemiBold)
-                val ps = pinState
-                if (ps.isEmpty()) Text("None. Waking a PC through this phone and scanning the network need no PIN. Set a PIN for each Windows account in WoL Host > Remote PIN; they are copied here automatically.",
-                    color = Color(0xFFF59E0B), fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
-                else {
-                    Text("✔ Required for wake and scan · the PIN of any account below · set in WoL Host", color = Color(0xFF22C55E), modifier = Modifier.padding(top = 6.dp))
-                    ps.forEach { Text("• ${it.user.ifEmpty { "PIN" }} · " + (if (it.exp > 0) "expires ${fmt(it.exp * 1000)}" else "permanent"), color = Color.Gray, fontSize = 13.sp) }
-                }
-            }
-            Card {
                 Text("PC token", color = Color.White, fontWeight = FontWeight.SemiBold)
                 Text("Each token works for ONE PC only. Generate a separate token for every PC you want to connect. First time only: the app opens Tailscale so you can sign in and copy an access token; it picks it up automatically.",
                     color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(vertical = 6.dp))
-                Button({ if (apiKey.isBlank()) {
+                val unusedTok = clients.firstOrNull { it.ip.isEmpty() && it.token.isNotEmpty() && System.currentTimeMillis() - it.made < 3300000 }      // its Tailscale key is still valid (1 h)
+                Button({ if (unusedTok != null) { pcToken = unusedTok.token; msg = "You already have an unused token. Use it first - a new one can only be made after it has joined a device." }
+                    else if (apiKey.isBlank()) {
                         msg = "Sign in, tap \"Generate access token\", then Copy. Come back here and I'll finish automatically."
                         startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://login.tailscale.com/admin/settings/keys")))
                     } else generate() },
-                    Modifier.fillMaxWidth()) { Text(if (apiKey.isBlank()) "Get access from Tailscale & generate token" else "Generate PC token") }
+                    Modifier.fillMaxWidth()) { Text(if (unusedTok != null) "Show unused token" else if (apiKey.isBlank()) "Get access from Tailscale & generate token" else "Generate PC token") }
                 if (msg.isNotEmpty()) Text(msg, color = Color(0xFF9DB2FF), modifier = Modifier.padding(top = 8.dp))
                 if (pcToken.isNotEmpty()) {
                     Text(pcToken, color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(vertical = 8.dp))
