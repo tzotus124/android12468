@@ -125,16 +125,19 @@ class MainActivity : ComponentActivity() {
         fun fmt(t: Long) = if (t <= 0) "—" else java.text.SimpleDateFormat("dd MMM yyyy HH:mm", java.util.Locale.getDefault()).format(java.util.Date(t))
         confirmRemove?.let { c -> AlertDialog(onDismissRequest = { confirmRemove = null },
             title = { Text("Remove ${c.name.ifEmpty { "this token" }}?") },
-            text = { Text("This client will no longer be able to wake hosts through this phone. Its token stops working immediately.") },
-            confirmButton = { TextButton({ editClients(this@MainActivity) { l -> l.removeAll { it.secret == c.secret } }; clients = loadClients(this@MainActivity); confirmRemove = null }) { Text("Remove", color = Color(0xFFEF4444)) } },
+            text = { Text("Its token stops working immediately, so it can no longer use this phone." + if (c.role == "host") " The saved MAC address of this host is deleted too." else "") },
+            confirmButton = { TextButton({ editClients(this@MainActivity) { l -> l.removeAll { it.secret == c.secret } }; if (c.role == "host" && c.ip.isNotEmpty()) editHosts(this@MainActivity) { l -> l.removeAll { it.ip == c.ip } }; clients = loadClients(this@MainActivity); hosts = loadHosts(this@MainActivity); confirmRemove = null }) { Text("Remove", color = Color(0xFFEF4444)) } },
             dismissButton = { TextButton({ confirmRemove = null }) { Text("Cancel") } }) }
 
         confirmHost?.let { h -> AlertDialog(onDismissRequest = { confirmHost = null },
             title = { Text("Remove ${h.name.ifEmpty { h.ip }}?") },
-            text = { Text("The saved MAC address of this host is deleted from this phone. It is saved again when WoL Host on that PC joins with a token.") },
-            confirmButton = { TextButton({ editHosts(this@MainActivity) { l -> l.removeAll { it.ip == h.ip } }; hosts = loadHosts(this@MainActivity); confirmHost = null }) { Text("Remove", color = Color(0xFFEF4444)) } },
+            text = { Text("The saved MAC address of this host and its token are deleted from this phone. To add the host again, generate a new token and paste it into WoL Host > Set up.") },
+            confirmButton = { TextButton({ editHosts(this@MainActivity) { l -> l.removeAll { it.ip == h.ip } }; editClients(this@MainActivity) { l -> l.removeAll { it.role == "host" && it.ip == h.ip } }
+                hosts = loadHosts(this@MainActivity); clients = loadClients(this@MainActivity); confirmHost = null }) { Text("Remove", color = Color(0xFFEF4444)) } },
             dismissButton = { TextButton({ confirmHost = null }) { Text("Cancel") } }) }
 
+        // a host whose token was used is detected at once (its first request marks the token as WoL Host's); its MAC address is added as soon as it arrives
+        val pendingHosts = clients.filter { it.role == "host" && it.ip.isNotEmpty() && hosts.none { h -> h.ip == it.ip } }
         Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF0B1020), Color(0xFF1A1440))))
             .statusBarsPadding().verticalScroll(rememberScrollState()).padding(20.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             if (page == "logs") {
@@ -153,7 +156,7 @@ class MainActivity : ComponentActivity() {
             TabRow(selectedTabIndex = if (page == "approved") 1 else if (page == "devices") 2 else 0, containerColor = Color.Transparent) {
                 Tab(page == "home", { page = "home" }, text = { Text("Home") })
                 Tab(page == "approved", { page = "approved" }, text = { Text("Clients (${clients.count { it.ip.isNotEmpty() }})") })
-                Tab(page == "devices", { page = "devices" }, text = { Text("Hosts (${hosts.size})") })
+                Tab(page == "devices", { page = "devices" }, text = { Text("Hosts (${hosts.size + pendingHosts.size})") })
             }
             if (page == "devices") {
                 Card {
@@ -161,7 +164,13 @@ class MainActivity : ComponentActivity() {
                     Text("A host is a PC set up with WoL Host. When it joins with a token it sends its Tailscale IP and physical MAC address here, so this phone can wake it. Clients get this list automatically when they join. Remove a host to forget it.",
                         color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
                 }
-                if (hosts.isEmpty()) Card { Text("No hosts yet. Generate a token on the Home tab and paste it into WoL Host > Set up; the host appears here by itself.", color = Color.Gray) }
+                pendingHosts.forEach { c -> Card {
+                    Text(c.name.ifEmpty { c.ip }, color = Color.White, fontWeight = FontWeight.SemiBold)
+                    Text("Detected · waiting for its MAC address", color = Color(0xFFF59E0B), fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp))
+                    Text("Tailscale IP: ${c.ip}", color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
+                    OutlinedButton({ confirmRemove = c }, Modifier.fillMaxWidth().padding(top = 10.dp)) { Text("Remove host", color = Color(0xFFEF4444)) }
+                } }
+                if (hosts.isEmpty() && pendingHosts.isEmpty()) Card { Text("No hosts yet. Generate a token on the Home tab and paste it into WoL Host > Set up; the host appears here by itself.", color = Color.Gray) }
                 hosts.sortedByDescending { it.updated }.forEach { h -> Card {
                     Text(h.name.ifEmpty { h.ip }, color = Color.White, fontWeight = FontWeight.SemiBold)
                     h.macs.forEach { Text("MAC  $it", color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp)) }
