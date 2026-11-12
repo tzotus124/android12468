@@ -1,0 +1,10 @@
+[project]
+name = "pom-prep"
+version = "1.0.0"
+description = "Principles of Management mid-term prep"
+requires-python = ">=3.10"
+dependencies = ["flet"]
+
+[tool.flet]
+org = "pk.edu.iub"
+product = "POM Mid-Term Prep"
